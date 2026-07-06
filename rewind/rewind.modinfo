@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Mod id="rewind_map_history" version="1"
+	xmlns="ModInfo">
+	<Properties>
+		<Name>REWIND: Replay Map History</Name>
+		<Description>Records your game turn-by-turn and replays it as an animated hex-map timelapse — territory, borders, cities, units, wonders and resources across the whole game. Watch it in a new Rewind tab on the end-game Victories screen, or live from a checkbox by the minimap (with or without fog). It is save-affecting: a game saved with it lists it as required so recording survives save/reload. A soft-disable setting is provided to allow disabling without invalidating saves.</Description>
+		<Authors>SLIM_AL</Authors>
+		<EnabledByDefault>1</EnabledByDefault>
+		<ShowInBrowser>1</ShowInBrowser>
+	</Properties>
+	<!-- DELIBERATELY save-affecting (AffectsSavedGames omitted → default save-affecting).
+	     A recorder MUST be restored on load to keep recording across save/reload, and the
+	     engine only restores mods that are in the save's requiredMods list, i.e. save-affecting
+	     ones. Do NOT add <AffectsSavedGames>0</AffectsSavedGames>. -->
+	<Dependencies>
+		<Mod id="base-standard" title="LOC_MODULE_BASE_STANDARD_NAME"/>
+	</Dependencies>
+	<ActionCriteria>
+		<Criteria id="always">
+			<AlwaysMet></AlwaysMet>
+		</Criteria>
+	</ActionCriteria>
+	<ActionGroups>
+		<ActionGroup id="rewind-ingame" scope="game" criteria="always">
+			<Actions>
+				<UpdateText>
+					<Item>text/en_us/RewindOptionsText.xml</Item>
+				</UpdateText>
+				<UIScripts>
+					<Item>ui/rewind-recorder.js</Item>
+					<Item>ui/rewind-playback.js</Item>
+					<Item>ui/rewind-endgame-tab.js</Item>
+					<Item>ui/rewind-options.js</Item>
+				</UIScripts>
+			</Actions>
+		</ActionGroup>
+		<!-- Shell (main menu) scope: the Options-menu integration (Game > Rewind). Lets a player neutralize
+		     the mod via the RewindDisabled user-option WITHOUT disabling it in Add-Ons (which would block
+		     their saves from loading, since the mod is save-affecting). The Options screen is reachable from
+		     the main menu, so this stays usable even if an in-game bug appears. -->
+		<ActionGroup id="rewind-shell" scope="shell" criteria="always">
+			<Actions>
+				<UpdateText>
+					<Item>text/en_us/RewindOptionsText.xml</Item>
+				</UpdateText>
+				<UIScripts>
+					<Item>ui/rewind-options.js</Item>
+				</UIScripts>
+			</Actions>
+		</ActionGroup>
+	</ActionGroups>
+</Mod>

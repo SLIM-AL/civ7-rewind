@@ -1,0 +1,47 @@
+<?xml version='1.0' encoding='utf-8'?>
+<Database>
+	<EnglishText>
+		<Row Tag="LOC_OPTIONS_GROUP_REWIND">
+			<Text>Rewind</Text>
+		</Row>
+		<Row Tag="LOC_OPTIONS_REWIND_DISABLE">
+			<Text>Disable Rewind</Text>
+		</Row>
+		<Row Tag="LOC_OPTIONS_REWIND_DISABLE_DESCRIPTION">
+			<Text>Stops all recording and hides the Rewind UI, but keeps the mod installed so your saves still load.</Text>
+		</Row>
+		<Row Tag="LOC_OPTIONS_REWIND_AUTODELETE">
+			<Text>Delete replay data on turn end</Text>
+		</Row>
+		<Row Tag="LOC_OPTIONS_REWIND_AUTODELETE_DESCRIPTION">
+			<Text>Wipes all Rewind data for the current save on turn end.</Text>
+		</Row>
+		<Row Tag="LOC_OPTIONS_REWIND_LOADBADGE">
+			<Text>Show load indicator</Text>
+		</Row>
+		<Row Tag="LOC_OPTIONS_REWIND_LOADBADGE_DESCRIPTION">
+			<Text>Shows a small status message in the bottom-left corner while Rewind captures the map on load.</Text>
+		</Row>
+		<!-- Playback panel transport-button captions (fxs-button renders caption via data-l10n-id).
+		     The triangle glyphs render fine; avoid the pipe '|' char — Civ's loc system treats it as
+		     markup and drops it, so skip-to-start/end use DOUBLE triangles instead of a bar. -->
+		<Row Tag="LOC_REWIND_TO_START">
+			<Text>◀◀</Text>
+		</Row>
+		<Row Tag="LOC_REWIND_PREV">
+			<Text>◀</Text>
+		</Row>
+		<Row Tag="LOC_REWIND_PLAY">
+			<Text>Play</Text>
+		</Row>
+		<Row Tag="LOC_REWIND_PAUSE">
+			<Text>Pause</Text>
+		</Row>
+		<Row Tag="LOC_REWIND_NEXT">
+			<Text>▶</Text>
+		</Row>
+		<Row Tag="LOC_REWIND_TO_END">
+			<Text>▶▶</Text>
+		</Row>
+	</EnglishText>
+</Database>

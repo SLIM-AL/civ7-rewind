@@ -1,0 +1,17 @@
+# Scratch / OS / editor
+*.swp
+*~
+.DS_Store
+/scratchpad/
+
+# Node (in case we add tooling later)
+node_modules/
+
+# Logs copied in from the game for inspection
+*.log
+
+# Claude Code local (machine-specific) settings
+.claude/settings.local.json
+
+# Claude Code local project config
+.claude/
