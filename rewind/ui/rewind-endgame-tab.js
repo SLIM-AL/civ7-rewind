@@ -1,5 +1,5 @@
 /**
- * Civilization VII Rewind — endgame Victories tab (Route 1 prototype)
+ * Civilization VII Rewind — endgame Victories tab
  *
  * Adds a native "Rewind" tab to the end-game Victories screen by re-registering the ui-next
  * "VictoriesScreen" component with a higher overridePriority. ComponentRegistry wraps each
@@ -9,7 +9,9 @@
  * call the base factory; we reproduce the base render (so all victory tabs stay intact) and add
  * one extra Tab.Item.
  *
- * PROTOTYPE: the extra tab just shows a placeholder. Wiring it to show/hide our map comes next.
+ * The extra tab drives the replay map via window.RewindReplay (rewind-playback.js): prebuild on
+ * mount, show/hide on tab change; its native body is a "Loading map…" placard the opaque map
+ * overlay simply covers once revealed.
  *
  * NOTE: this is a faithful copy of base-standard/ui-next/screens/victories/victories-screen.js's
  * VictoriesScreenComponent — if the base screen changes in a patch, this copy may need updating.

@@ -1,16 +1,18 @@
 /**
- * Civilization VII Rewind — Playback UI (Milestone 2c: hex terrain map + borders)
+ * Civilization VII Rewind — Playback UI
  *
- * On-demand map: a "Rewind" launcher opens a scrubber (Play/Pause, a draggable div
- * timeline track, step buttons, turn label) + a hex map. Tiles are terrain-colored hexagons
- * (minimap-like). Territory: rural owned tiles get a strong PRIMARY-color tint,
- * URBAN tiles are solid SECONDARY, the outer border is SECONDARY, and the
- * city-center dot is PRIMARY. Opens at turn 1.
+ * On-demand map, opened from the endgame Victories "Rewind" tab or the in-game minimap checkbox.
+ * A scrubber (Play/Pause, draggable div timeline with per-age sections, step buttons, speed
+ * cycle) + a hex map with toggleable layers (territory, borders, units, wonders, resources,
+ * fog, leader ribbon). Territory: rural owned tiles fill PRIMARY, urban/center tiles solid
+ * SECONDARY, the outer border SECONDARY, the city-center dot/star PRIMARY. Opens at the most
+ * recent frame (applyOpenPosition); reopening within the same game turn keeps the position.
  *
- * Rendering note (Coherent — only these composite): position:FIXED div, color via
- * cssText, .style.left/.top/.backgroundColor setters, clip-path, transform:rotate.
- * (canvas, position:absolute, nested-flex, .style.background shorthand: all fail.)
- * Hex tiles use clip-path; border edges are rotated thin divs; city dots are circles.
+ * Rendering (Coherent/Gameface): the map is three stacked <canvas> layers (see ensureMapRoot);
+ * the chrome (panel, scrubber, tooltips, ribbon) is position:FIXED DOM styled via individual
+ * style setters. Native <input type=range> is dead in Gameface — the scrubber is a div track +
+ * mouse drag. KNOWN ISSUE: sustained aggressive scrubbing overflows Coherent's 49152-item
+ * static-resource pool and crashes the game — see the note at the canvas-draw section.
  *
  * Storage: reads the GAME config store (Configuration.getGame) written by rewind-recorder.js — a global
  * frame index (gi) across all ages; keep the schema in sync with the recorder.
@@ -44,7 +46,7 @@ const KEY_NATURAL = 'natural';
 // incremental units), so we comfortably hit the target — a genuine 4x that draws all 4x the turns.
 const PLAY_SPEEDS = [400, 200, 100, 800];               // ms per turn for 1x / 2x / 4x / 0.5x
 const PLAY_SPEED_LABELS = ['1x', '2x', '4x', '0.5x'];
-const MIN_TURN_MS = 45;                                 // safe floor: never draw faster than this, so a rare recreate has time to free
+const MIN_TURN_MS = 45;                                 // floor between turn draws: a heavy turn slows playback instead of stacking draws back-to-back
 let speedIdx = 0;
 const LAYOUT_PAD = 8;                                    // inner padding within the available area
 const MAX_FILL = 0.97;                                   // map occupies at most this fraction of the zone (keeps a small margin)
@@ -435,16 +437,16 @@ function mkArea(x, y, w, h, exitLeft, exitTop) {
 let layoutDims = '';
 let backdrop = null;
 // The map is drawn across THREE stacked <canvas> layers, split along the static/dynamic seam so the
-// expensive static terrain leaves the per-turn path and each churning layer flushes its retained
-// draw-resources (Coherent's 49152 cap) independently:
+// expensive static terrain leaves the per-turn path and each volatile layer can be redrawn (or one
+// day cached/patched) independently:
 //   bg    — static terrain (fog off) / flat hidden fill (fog on); redrawn only on layout or fog change.
 //   state — territory fills, borders, fog dim, resources, wonders; redrawn per turn.
 //   units — unit squares; redrawn per turn (densest, most volatile layer; own flush cadence).
 // A module-level mapCtx points at the layer being drawn, so the low-level path builders (which all draw
 // into mapCtx) stay unchanged. mapRoot aliases the bg element for existence/geometry guards.
-const bgLayer    = { id: 'rewind-map-bg',    z: 99991, el: null, ctx: null, accum: 0, dyn: false };
-const stateLayer = { id: 'rewind-map-state', z: 99992, el: null, ctx: null, accum: 0, dyn: true };
-const unitLayer  = { id: 'rewind-map-units', z: 99993, el: null, ctx: null, accum: 0, dyn: true };
+const bgLayer    = { id: 'rewind-map-bg',    z: 99991, el: null, ctx: null };
+const stateLayer = { id: 'rewind-map-state', z: 99992, el: null, ctx: null };
+const unitLayer  = { id: 'rewind-map-units', z: 99993, el: null, ctx: null };
 const LAYERS = [bgLayer, stateLayer, unitLayer];
 let mapRoot = null, mapVisible = false;
 let building = false, buildToken = 0, revealWhenBuilt = false;
@@ -484,9 +486,9 @@ function syncCheckbox(on) {
   suppressCheckbox = true;
   try { cb.setAttribute('selected', want); } finally { suppressCheckbox = false; }
 }
-// Canvas renderer: the whole map is drawn into ONE <canvas> (see ensureMapRoot). This replaces the old
-// ~4k-div overlay, so there is a single node to composite — idle/hover never re-lays-out or re-rasters a
-// huge DOM, and a frame change is just one ctx redraw.
+// Canvas renderer: the whole map is drawn into the three stacked <canvas> layers above (LAYERS). This
+// replaces the old ~4k-div overlay, so there are only a few nodes to composite — idle/hover never
+// re-lays-out or re-rasters a huge DOM, and a frame change is just ctx redraws.
 let mapCtx = null;                  // 2D context of the map canvas
 let mapDpr = 1;                     // device-pixel ratio the canvas backing store is sized for
 let curFrame = null;                // last drawn frame Map
@@ -626,11 +628,26 @@ function positionPanel() {
 }
 
 // --- canvas draw (BATCHED by color) ------------------------------------------------------------------
-// Calibration proved NO canvas op feeds Coherent's 49152 "static resource" pool: fills, strokes, arcs,
-// clearRect, canvas.width reset, and canvas-element recreate all ran to hundreds of thousands with no crash.
-// (The real leak turned out to be the leader ribbon recreating image/box-shadow DOM every rebuild — fixed in
-// buildRibbon.) So the map uses one persistent canvas per layer, cleared with clearRect each frame — fast,
-// leak-free, never recreated. The DPR transform persists across clearRect (it's set once in applyLayerBox).
+// KNOWN ISSUE (mitigated 2026-07-08, not fully fixed): sustained aggressive scrubbing overflows Coherent's
+// 49152-item "static resource" pool and hard-crashes the game (Renderer.log: "PartitionedResourceList.
+// AddStaticResource(), attempting to add more than 49152 items"). Nothing frees the pool (clearRect,
+// canvas.width reset, element recreate, periodic layer recycling all failed). Instrumented A/B runs
+// attributed the leak to the UNIT LAYER's small one-shot beginPath/fill pairs (~0.3 pool items per call;
+// units-off scrubbing leaked ~nothing across 90k+ batched state-layer calls). NOT one-item-per-any-call
+// (250k+ calls ran per session = 5x the pool); NOT the leader ribbon (its separate DOM-recreation leak is
+// fixed in buildRibbon); rect() vs moveTo/lineTo made no difference.
+// MITIGATION shipped here: drawUnitLayer's full-repaint path batches unit fills by color, which cut the
+// leak ~3.6x — hard CONTINUOUS scrubbing now survives ~3,500 redraws per game session (vs ~970 unbatched);
+// normal playback/scrubbing doesn't get near that. A residual per-redraw leak remains; mechanism
+// unresolved (possibly per-subpath — batching didn't zero it).
+// Abandoned fixes, for the record (2026-07-08):
+//   • Frame cache (render each frame once, blit on scrub): LRU eviction reopens the leak on real
+//     (hundreds-of-turns) games, so it can't be the safety mechanism.
+//   • Glyph sprites (stamp pre-rendered unit/resource canvases via drawImage): Cohtml never rasterizes a
+//     canvas that isn't visibly painted — detached, offscreen-parked, and occluded-under-the-map sprite
+//     sheets all stamp BLACK — and drawImage from a backing-less canvas itself leaked ~1 per 50 calls.
+// Each layer is one persistent canvas cleared with clearRect each frame; the DPR transform persists
+// across clearRect (it's set once in applyLayerBox).
 function beginLayer(L) {
   mapCtx = L.ctx; mapRoot = bgLayer.el;
   mapCtx.clearRect(0, 0, mapPxW, mapPxH);
@@ -696,7 +713,8 @@ function collectTileBorders(i, frame, edges, dots, stars, edgesTop) {
   else if (c === 2) pushGroup(dots, centerDot, i);    // major city: dot
 }
 // --- static background layer -------------------------------------------------
-// (Re)draw the bg layer for the current fog state; clearRect first (leak-free, never recreated). Fog OFF:
+// (Re)draw the bg layer for the current fog state; clearRect first. Redrawn only on a layout or fog
+// change, so it sits outside the per-scrub redraw path. Fog OFF:
 // full terrain — the big static layer, drawn ONCE, so it leaves the per-turn path. Fog ON: a single flat
 // hidden-color fill (visible terrain is drawn per turn on the state layer, since visibility changes).
 function renderBackground() {
@@ -713,11 +731,11 @@ function renderBackground() {
 }
 function ensureBackground() { if (bgDirty || bgFog !== fogMode) renderBackground(); }
 
-// --- change detection + safety valve -----------------------------------------
+// --- change detection ---------------------------------------------------------
 // State-layer delta gate: on a SEQUENTIAL advance we can skip the whole state redraw when nothing that layer
 // draws changed — read straight off the save's per-turn deltas (no hashing). rec.terr/rec.won empty means no
 // territory/wonder change; rec.vis empty (fog on) means no visibility change; suzerainty/age/toggles tracked
-// separately. Skipping leaves the canvas as-is (free re-composite) and adds nothing to accum → no recreate.
+// separately. Skipping leaves the canvas as-is (free re-composite) and issues no draw calls.
 let lastStatePos = -2, lastStateSig = '', lastSuzeSig = '';
 function stateSignature() { return `${showTerritory?1:0}${showBorders?1:0}${showResources?1:0}${showWonders?1:0}${fogMode?1:0}|${frames[pos]?frames[pos][0]:''}`; }
 function suzeSig(t) { const m = readSuzerainTurn(t); if (!m || !m.size) return ''; const a = []; for (const [cs, s] of m) a.push(cs + ':' + s); a.sort(); return a.join(','); }
@@ -812,7 +830,9 @@ function unitMapFor(p, vis) {
 // Units layer (top): drawn as squares (ring + core). Because units sit alone on this canvas, we update it
 // INCREMENTALLY on a sequential advance — clearRect only the tiles units left, redraw only the tiles that
 // changed — instead of clearing and repainting the whole (late-game huge) carpet every turn. Falls back to a
-// full repaint on any non-sequential jump (scrub), a budget recreate, or a toggle/fog change.
+// full repaint on any non-sequential jump (scrub) or a toggle/fog change. The full-repaint path batches its
+// fills by color as the scrub-crash mitigation (see the KNOWN ISSUE note at the canvas-draw section); the
+// incremental path still draws changed units one-shot — a handful per turn, negligible leak.
 function drawUnitLayer(frame, vis) {
   const r = Math.max(3, Math.round(hexW * 0.19)), bw = Math.max(2, Math.round(hexW * 0.07)), pad = r + 1;
   const cx = i => basePos[i].x + hexW / 2, cy = i => basePos[i].y + hexH / 2;
@@ -822,7 +842,15 @@ function drawUnitLayer(frame, vis) {
   const full = !sequential || !showUnits;
   if (full) {
     beginLayer(unitLayer);   // clearRect the whole layer, then repaint every unit
-    for (const [i, cols] of newMap) drawOne(i, cols);
+    // BATCH by color — one beginPath/fill per color group (rings first, then cores on top; markers never
+    // overlap, one per tile) instead of 2 one-shot fills per unit. This is the scrub-crash mitigation:
+    // one-shot unit fills leak ~0.3 static-resource pool items each, batched fills far less — measured
+    // fuse went from ~970 to ~3,500 hard-scrub redraws per session. See the KNOWN ISSUE note above.
+    const rings = new Map(), cores = new Map();
+    for (const [i, cols] of newMap) { const k = cols.indexOf('|'); pushGroup(rings, cols.slice(0, k), i); pushGroup(cores, cols.slice(k + 1), i); }
+    for (const [color, idxs] of rings) { mapCtx.beginPath(); for (const i of idxs) squareSubpath(cx(i), cy(i), r); mapCtx.fillStyle = color; mapCtx.fill(); }
+    const cr = Math.max(1, r - bw);
+    for (const [color, idxs] of cores) { mapCtx.beginPath(); for (const i of idxs) squareSubpath(cx(i), cy(i), cr); mapCtx.fillStyle = color; mapCtx.fill(); }
   } else {
     mapCtx = unitLayer.ctx; mapRoot = bgLayer.el;   // patch the retained canvas in place (no full clear)
     for (const [i, oc] of lastUnitMap) { if (newMap.get(i) !== oc) mapCtx.clearRect(cx(i) - pad, cy(i) - pad, 2 * pad, 2 * pad); }   // departed / changed → clear
@@ -981,11 +1009,13 @@ function trackFrac(clientX) {
   return Math.max(0, Math.min(1, (clientX - r.left) / r.width));
 }
 function nowMs() { return (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now(); }
-// rAF-paced COALESCING for drag scrubbing. Canvas drawing doesn't accumulate resources (the old 49152 crash
-// was the leader ribbon, now fixed + suppressed while seeking), so we no longer throttle to a fixed rate.
-// Instead we always render the LATEST cursor position on the next animation frame, and only arm the next
-// render once the current one has run — so the rate self-limits to whatever THIS machine + map can draw
-// (fast hardware → ~display refresh; slow/large → fewer frames, coalescing the rest). No fixed ms floor.
+// rAF-paced COALESCING for drag scrubbing: always render the LATEST cursor position on the next animation
+// frame, and only arm the next render once the current one has run — so the rate self-limits to whatever
+// THIS machine + map can draw (fast hardware → ~display refresh; slow/large → fewer frames, coalescing the
+// rest). No fixed ms floor. NOTE: each full redraw still leaks a small residue of static resources (see the
+// KNOWN ISSUE at the canvas-draw section) — with unit batching in place, sustained hard scrubbing reaches
+// the 49152 pool cap after roughly ~3,500 redraws in one game session. Normal use doesn't approach that;
+// a throttle here would only stretch the fuse further at the cost of scrub responsiveness.
 let seekPending = false, seekTargetX = 0, seekLastGi = -1;
 function renderSeekTarget() {
   if (!frames.length) return;

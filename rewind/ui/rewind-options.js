@@ -1,9 +1,10 @@
 /**
  * Civilization VII Rewind — Options-menu integration.
  *
- * Adds a "Rewind" section under the Game options category with two checkboxes:
+ * Adds a "Rewind" section under the Game options category with three checkboxes:
  *   • Disable Rewind (safe mode)        -> user option Interface/RewindDisabled  (was the main-menu button)
  *   • Auto-delete replay data each turn -> user option Interface/RewindAutoDelete
+ *   • Show recorder timing badge        -> user option Interface/RewindShowLoadBadge
  *
  * Both persist via UI.setOption("user", ...) — player settings, never stored in a save. This script is
  * loaded in BOTH the shell (main-menu Options) and game (in-game Options) scopes so the section shows up

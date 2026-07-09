@@ -1,43 +1,53 @@
 /**
- * Civilization VII Rewind — Recorder (Milestone 2: Territory + terrain + tile-class)
+ * Civilization VII Rewind — Recorder
  *
- * Passive, no UI. Each turn records the per-plot territory owner and tile class
- * (city-center / urban / other) into the Catalog/GameTutorial store, plus a static
- * terrain base map (for a minimap-like backdrop in playback). Snapshot on the first
- * record of a session and at Age transitions; compact diffs otherwise.
+ * Passive, no UI. Each turn records a compact frame — territory owner + tile class, units,
+ * constructibles, settlements, man-made wonders, visibility, suzerains, player identity /
+ * relationships / victory points — into the GAME config store (survives save/reload AND age
+ * transitions; see gameStore below), plus a static terrain base map. Every age's first frame
+ * (and the first record of a session) is a snapshot; other frames are diffs.
  *
  * ---------------------------------------------------------------------------
- * STORAGE FORMAT (v2)  — Catalog "CivRewind"
+ * STORAGE FORMAT (v14) — game-config store, keys "CivRewind__<obj>_<key>"
  * ---------------------------------------------------------------------------
+ * Records are keyed by a GLOBAL frame index gi that runs across all ages (in-age turn numbers
+ * reset to 1 each age, so they can't be the key — see record()).
+ *
  * Object "meta", key "index" → JSON manifest:
- *   { v:2, w, h, turns:[<turn>...], snaps:[<turn>...], age:<Game.age> }
+ *   { v:14, w, h, frames:[[ageId, inAgeTurn, snap], …], ages:[[startGi, ageId, ageName], …],
+ *     unitTypes:[[hash, name, cat], …], buildingTypes:[[hash, name, classCode], …],
+ *     wonderTypes:[[hash, name], …], victoryTypes:[label, …] }
+ *   Type tables: names are resolved + baked in at record time and a small index is stored per
+ *   entity, so playback never depends on a hash surviving game updates / mod changes.
  *
- * Object "base", key "terrain" → JSON array length w*h of terrain class codes
- *   (static-ish; rewritten on each snapshot). Codes:
- *     0 deep ocean | 1 coastal sea | 2 mountain | 3 desert | 4 plains |
- *     5 grassland | 6 tropical | 7 tundra | 8 other land | 9 lake | 10 navigable river
- *   (9/10 added later; old recordings have coast/lake/river all as 1 → render as coastal sea.)
- *
- * Object "turns", key "t<turn>" → JSON record:
- *   { t:<turn>, s:0|1, terr:[[plotIndex, ownerId, cls], ...] }
+ * Object "turns", key "t<gi>" → { t:<inAgeTurn>, s:0|1, terr, bld, set, vis, won }
+ *   terr: flat packTerr(plot, owner, cls) ints — snapshot lists every owned plot; diff lists only
+ *         plots whose owner or cls changed (owner -1 = became unowned).
  *     cls: 0 normal/rural | 1 urban | 2 city-center (non-capital city, or independent power)
  *          | 3 town center | 4 capital center
- *     (codes 3/4 added later; old recordings only have 0..2 → all centers read as code 2.)
+ *   bld: [[plot, [buildingTypeIdx…]], …] delta ([] = all constructibles gone)
+ *   set: [[centerPlot, name, pop, typeLabel, [yields]], …] delta ([centerPlot] = removed)
+ *   vis: flat packVis(plot, state) ints, local-observer visibility delta
+ *        (0 hidden / 1 revealed / 2 in-LOS)
+ *   won: [[plot, owner, wonderTypeIdx], …] delta ([plot] = removed)
  *
- * Object "units", key "u<turn>" → JSON record (full list every turn; units move too much to diff):
- *   { t:<turn>, u:[[plotIndex, ownerId, cat], ...] }
- *     cat: 0 land military | 1 naval | 2 civilian/other land | 3 air
- *          (3 is recorded but playback may render it like military for now — future-proofing.)
+ * Object "units", key "u<gi>" → { t, u: flat packUnit(plot, owner, unitTypeIdx) ints }
+ *   (full list every turn; units move too much to diff)
+ *     cat (in the unit-type table): 0 land military | 1 naval | 2 civilian/other land | 3 air
  *
- * Object "wonders", key "w<turn>" → JSON record (man-made wonders; owner can change, so per turn):
- *   { t:<turn>, w:[[plotIndex, ownerId], ...] }   (ConstructibleClass === 'WONDER')
- * Object "base", key "natural" → JSON array of plotIndexes that are NATURAL wonders (static, like
- *   terrain; rewritten on each snapshot).
- *     s=1 snapshot: every owned plot listed. s=0 diff: only plots whose owner OR
- *     cls changed; ownerId=-1 (cls 0) means the plot became unowned.
+ * Object "suze", key "s<gi>" → { t, s:[[cityStateId, suzerainId], …] } (full list every turn)
+ * Object "players", key "p<gi>" → { t, s, vp, idd, met, rel } — victory points + met full each
+ *   turn; identity + relationships delta-coded (see the read/reconstruct pair in rewind-playback.js)
+ *
+ * Object "base" (static layers):
+ *   key "terrain" → JSON array length w*h of terrain class codes (captured once per game):
+ *     0 deep ocean | 1 coastal sea | 2 mountain | 3 desert | 4 plains |
+ *     5 grassland | 6 tropical | 7 tundra | 8 other land | 9 lake | 10 navigable river
+ *   key "natural" → plotIndexes that are NATURAL wonders (captured once)
+ *   key "res_<ageId>" → [[plot, resourceClassCode], …] per age (see RESOURCE_CLASS_CODE)
  *
  * plotIndex is the engine index (GameplayMap.getIndexFromXY / getLocationFromIndex).
- * Reconstruction: nearest snapshot <= turn, then apply diffs forward.
+ * Reconstruction: nearest snapshot <= gi, then apply diffs forward (rewind-playback.js).
  * ---------------------------------------------------------------------------
  */
 
