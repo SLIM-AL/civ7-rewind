@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<Mod id="rewind_map_history" version="1"
+<Mod id="rewind_map_history" version="2"
 	xmlns="ModInfo">
 	<Properties>
 		<Name>REWIND: Replay Map History</Name>
