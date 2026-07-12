@@ -14,9 +14,11 @@
  * reset to 1 each age, so they can't be the key — see record()).
  *
  * Object "meta", key "index" → JSON manifest:
- *   { v:14, w, h, frames:[[ageId, inAgeTurn, snap], …], ages:[[startGi, ageId, ageName], …],
+ *   { v:14, rev, w, h, frames:[[ageId, inAgeTurn, snap], …], ages:[[startGi, ageId, ageName], …],
  *     unitTypes:[[hash, name, cat], …], buildingTypes:[[hash, name, classCode], …],
  *     wonderTypes:[[hash, name], …], victoryTypes:[label, …] }
+ *   rev: bumps whenever a record changed drawable content — lets playback detect same-turn
+ *        re-records (mid-turn "record on map open") and drop its caches (see rewind-playback.js).
  *   Type tables: names are resolved + baked in at record time and a small index is stored per
  *   entity, so playback never depends on a hash surviving game updates / mod changes.
  *
@@ -88,11 +90,22 @@ let prevCls = null;        // Int8Array[w*h]
 let prevVis = null;        // Int8Array[w*h]: 0 hidden / 1 revealed / 2 in-LOS (local observer); for delta-coding visibility
 let prevBuildings = new Map();   // plotIndex -> sorted [buildingTypeIndex]; for delta-coding constructibles
 let prevSettlements = new Map(); // centerPlotIndex -> [name, pop, type, [yields]]; for delta-coding settlements
-let prevIdentity = new Map();    // playerId -> [leader, civ, adjective, primaryInt, secondaryInt, civType]; for delta-coding identity
+let lastUnitsJson = '', lastSuzeJson = '';   // last written per-frame payloads, for the manifest-rev change check
+let prevIdentity = new Map();    // playerId -> [leader, civ, adjective, primaryInt, secondaryInt, civType, csType]; for delta-coding identity
 let prevRelationships = new Map(); // "a,b" (a<b majors) -> broad relationship code; for delta-coding relationships
 let prevWonders = new Map();      // plotIndex -> [ownerId, wonderTypeIndex]; for delta-coding man-made wonders
 let manifest = null;
 let lastTurnRecorded = -1;
+// Delta baselines are pinned to the PREVIOUS frame (gi-1): captured when a gi is first recorded and
+// restored for any RE-record of the same gi. Without this, a second record of a turn (e.g. record-on-open
+// mid-turn, then the end-of-turn record — same gi) would diff against a baseline the first record already
+// advanced, so the overwrite silently drops the first record's changes (a founded city vanishing until the
+// next age snapshot). base* hold references to the gi-1 prev* objects; prev* are always REASSIGNED (never
+// mutated in place), so the references stay valid.
+let lastRecordedGi = -1;
+let baseOwner = null, baseCls = null, baseVis = null;
+let baseBuildings = new Map(), baseSettlements = new Map(), baseWonders = new Map();
+let baseIdentity = new Map(), baseRelationships = new Map();
 
 // Persistence: the GAME config store (Configuration.editGame().setValue / getGame().getValue). Unlike the
 // GameTutorial-backed Catalog we used before, this SURVIVES age transitions (verified via the community
@@ -476,14 +489,17 @@ function relationshipsDelta(snapshot) {
 // UI.Player.get*ColorValueAsHex (playback already turns these into CSS via intToRgb).
 function playerIdentity(pid) {
   const p = Players.get(pid);
-  let leader = '', civ = '', adj = '', pc = 0, sc = 0, civType = '';
+  let leader = '', civ = '', adj = '', pc = 0, sc = 0, civType = '', csType = '';
   try { const cp = Configuration.getPlayer(pid); if (cp && cp.leaderName) leader = Locale.compose(cp.leaderName); } catch (e) {}
   try { if (p.civilizationFullName) civ = Locale.compose(p.civilizationFullName); } catch (e) {}
   try { if (p.civilizationAdjective) adj = Locale.compose(p.civilizationAdjective); } catch (e) {}
   try { pc = UI.Player.getPrimaryColorValueAsHex(pid) | 0; } catch (e) {}
   try { sc = UI.Player.getSecondaryColorValueAsHex(pid) | 0; } catch (e) {}
   try { if (p.civilizationType != null) civType = p.civilizationType; } catch (e) {}   // for the ribbon's civ symbol icon
-  return [leader, civ, adj, pc, sc, civType];
+  // City-state class code ("MILITARISTIC", "CULTURAL", …) — recorded so playback can label/color a
+  // city-state's tiles at frames from before it was dispersed (Players.get returns null by then).
+  try { if (!p.isMajor && p.getCityStateCityStateType) { const d = GameInfo.CityStateTypes.lookup(p.getCityStateCityStateType()); if (d && d.CityStateType) csType = d.CityStateType; } } catch (e) {}
+  return [leader, civ, adj, pc, sc, civType, csType];
 }
 function readIdentity() {
   const m = new Map();   // pid -> [leader, civ, adj, primaryInt, secondaryInt, civType]
@@ -498,10 +514,10 @@ function readIdentity() {
 }
 function identityDelta(snapshot) {
   const cur = readIdentity(), out = [];
-  const eq = (a, b) => a && b && a[0] === b[0] && a[1] === b[1] && a[2] === b[2] && a[3] === b[3] && a[4] === b[4] && a[5] === b[5];
-  if (snapshot) { for (const [pid, e] of cur) out.push([pid, e[0], e[1], e[2], e[3], e[4], e[5]]); }
+  const eq = (a, b) => a && b && a[0] === b[0] && a[1] === b[1] && a[2] === b[2] && a[3] === b[3] && a[4] === b[4] && a[5] === b[5] && a[6] === b[6];
+  if (snapshot) { for (const [pid, e] of cur) out.push([pid, e[0], e[1], e[2], e[3], e[4], e[5], e[6]]); }
   else {
-    for (const [pid, e] of cur) if (!eq(e, prevIdentity.get(pid))) out.push([pid, e[0], e[1], e[2], e[3], e[4], e[5]]);
+    for (const [pid, e] of cur) if (!eq(e, prevIdentity.get(pid))) out.push([pid, e[0], e[1], e[2], e[3], e[4], e[5], e[6]]);
     for (const [pid] of prevIdentity) if (!cur.has(pid)) out.push([pid]);
   }
   prevIdentity = cur;
@@ -713,6 +729,8 @@ function clearData(reSnapshot) {
     prevOwner = null; prevCls = null; prevVis = null; prevBuildings = new Map();
     prevSettlements = new Map(); prevIdentity = new Map(); prevRelationships = new Map(); prevWonders = new Map();
     lastTurnRecorded = -1;   // next record() is a clean snapshot
+    lastRecordedGi = -1; baseOwner = null; baseCls = null; baseVis = null;   // reset the pinned diff baselines
+    baseBuildings = new Map(); baseSettlements = new Map(); baseWonders = new Map(); baseIdentity = new Map(); baseRelationships = new Map();
     // Re-snapshot the current turn so the replay isn't empty (skipped for auto-delete, which wants nothing left).
     if (reSnapshot !== false) { try { if (typeof Game !== 'undefined' && Game.turn != null) record(Game.turn, true); } catch (e) {} }
     log(`clearData: wiped ${frameCount} frames${reSnapshot !== false ? ' and re-snapshotted current turn' : ''}`);
@@ -730,10 +748,27 @@ function record(turn, forceSnap) {
   const ageId = Game.age;
   const newAge = !manifest.frames.some((f) => f[0] === ageId);   // first frame ever recorded for this age?
   const { owner, cls } = readTiles();
-  const snapshot = forceSnap || !prevOwner || newAge;
   // gi: reuse the existing frame for (ageId, turn), else append a new one at the end.
   let gi = manifest.frames.findIndex((f) => f[0] === ageId && f[1] === turn);
   if (gi < 0) gi = manifest.frames.length;
+  // Pin the diff baseline to gi-1 (see base* declarations): the FIRST record of a gi saves the current
+  // prev* (state through gi-1); a RE-record of the same gi restores it, so re-records never diff against a
+  // baseline a prior record already advanced (which would drop that record's changes on overwrite).
+  const reRecord = (gi === lastRecordedGi);
+  if (reRecord) {
+    prevOwner = baseOwner; prevCls = baseCls; prevVis = baseVis;
+    prevBuildings = baseBuildings; prevSettlements = baseSettlements; prevWonders = baseWonders;
+    prevIdentity = baseIdentity; prevRelationships = baseRelationships;
+  } else {
+    baseOwner = prevOwner; baseCls = prevCls; baseVis = prevVis;
+    baseBuildings = prevBuildings; baseSettlements = prevSettlements; baseWonders = prevWonders;
+    baseIdentity = prevIdentity; baseRelationships = prevRelationships;
+    lastRecordedGi = gi;
+  }
+  // A re-record of a frame that was a SNAPSHOT stays a snapshot (must remain self-contained for playback's
+  // per-age reconstruction); otherwise the usual rule (forced / no baseline / new age).
+  const wasSnap = reRecord && manifest.frames[gi] && manifest.frames[gi][2] === 1;
+  const snapshot = forceSnap || !prevOwner || newAge || wasSnap;
   const terr = [];
 
   if (snapshot) {
@@ -753,9 +788,16 @@ function record(turn, forceSnap) {
   getCatalog().getObject(OBJ_TURNS).write('t' + gi, JSON.stringify({ t: turn, s: snapshot ? 1 : 0, terr, bld, set, vis, won }));
 
   const units = readUnits();
-  getCatalog().getObject(OBJ_UNITS).write('u' + gi, JSON.stringify({ t: turn, u: units }));
+  const unitsJson = JSON.stringify({ t: turn, u: units });
+  getCatalog().getObject(OBJ_UNITS).write('u' + gi, unitsJson);
   const suze = readSuzerain();
-  getCatalog().getObject(OBJ_SUZE).write('s' + gi, JSON.stringify({ t: turn, s: suze }));
+  const suzeJson = JSON.stringify({ t: turn, s: suze });
+  getCatalog().getObject(OBJ_SUZE).write('s' + gi, suzeJson);
+  // Manifest revision: bumped only when this record changed anything the map draws — lets playback detect
+  // SAME-TURN re-records (mid-turn "record on map open") and drop its caches; identical re-records don't
+  // churn the caches.
+  if (snapshot || terr.length || vis.length || won.length || set.length || (bld && bld.length) || unitsJson !== lastUnitsJson || suzeJson !== lastSuzeJson) manifest.rev = (manifest.rev || 0) + 1;
+  lastUnitsJson = unitsJson; lastSuzeJson = suzeJson;
   ensureVictoryTypes();                    // record the victory-point column labels once
   const vp = readVictoryPoints();          // per-major victory points by class + score (full each turn)
   const idd = identityDelta(snapshot);     // per-player identity, delta-coded
@@ -844,10 +886,29 @@ function onTurnBegin() {
 function onGameOrAgeEnd(evtName) {
   try {
     if (typeof Game === 'undefined' || Game.turn == null) return;
+    const prevLast = lastTurnRecorded;
     record(Game.turn, false);
+    // Restore the dedupe marker: if the game actually CONTINUES after this event (e.g. a rival's defeat
+    // mid-game), the next turn-begin must be allowed to overwrite this possibly-mid-turn frame with the
+    // fully-resolved end-of-turn state — record() dedupes by (age, turn), so it lands on the same frame.
+    lastTurnRecorded = prevLast;
     log(`final state recorded via '${evtName}' (turn ${Game.turn})`);
   } catch (e) { err(`onGameOrAgeEnd(${evtName}) failed: ${e}`); }
 }
+// Local player eliminated while the game continues (conquest of the last city): no further
+// LocalPlayerTurnBegin will ever fire for us, so the post-conquest world (opponent's borders complete)
+// would be missing from the replay entirely — capture it now. Rival defeats are recorded too when the
+// event payload is ambiguous (harmless: the next turn-begin overwrites with the resolved state).
+function onPlayerDefeat(data) {
+  try {
+    const pid = data && (data.player != null ? data.player : data.playerId);
+    if (pid != null && typeof GameContext !== 'undefined' && GameContext.localPlayerID != null && pid !== GameContext.localPlayerID) return;
+    onGameOrAgeEnd('PlayerDefeat');
+  } catch (e) { err(`onPlayerDefeat failed: ${e}`); }
+}
+// Endgame-screen safety net: rewind-playback calls this when the Victories screen mounts, so whatever
+// path led to the end screen, the final resolved world state is in the replay before the map builds.
+try { window.RewindRecordFinal = () => { try { if (!rewindDisabled() && started) onGameOrAgeEnd('endgame-screen'); } catch (e) {} }; } catch (e) {}
 
 // Auto-delete (Options > Rewind): wipe stored data at the end of every turn so saves never accumulate a
 // replay. Leaves nothing behind (no re-snapshot); the next turn begins recording a fresh baseline.
@@ -876,6 +937,7 @@ if (rewindDisabled()) {
   engine.on('LocalPlayerTurnEnd', onTurnEnd);
   engine.on('GameAgeEnded', () => onGameOrAgeEnd('GameAgeEnded'));   // captures each age's final resolved state (final age = game over)
   engine.on('TeamVictory', () => onGameOrAgeEnd('TeamVictory'));     // victory-triggered game over
+  engine.on('PlayerDefeat', onPlayerDefeat);                         // local elimination → capture the post-conquest final state
   try {
     if (typeof UI !== 'undefined' && UI.isInGame && UI.isInGame()) init('module-load');
   } catch (e) { /* events will cover it */ }

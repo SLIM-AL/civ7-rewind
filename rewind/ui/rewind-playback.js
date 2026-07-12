@@ -8,11 +8,13 @@
  * SECONDARY, the outer border SECONDARY, the city-center dot/star PRIMARY. Opens at the most
  * recent frame (applyOpenPosition); reopening within the same game turn keeps the position.
  *
- * Rendering (Coherent/Gameface): the map is three stacked <canvas> layers (see ensureMapRoot);
- * the chrome (panel, scrubber, tooltips, ribbon) is position:FIXED DOM styled via individual
- * style setters. Native <input type=range> is dead in Gameface — the scrubber is a div track +
- * mouse drag. KNOWN ISSUE: sustained aggressive scrubbing overflows Coherent's 49152-item
- * static-resource pool and crashes the game — see the note at the canvas-draw section.
+ * Rendering (Coherent/Gameface): the map is a small fixed set of stacked <canvas> layers (bg
+ * terrain, per-turn state, per-age resources, per-game natural wonders) plus DOM marker layers
+ * (man-made wonders, city dots, units) — see the layer overview above ensureMapRoot. The chrome
+ * (panel, scrubber, tooltips, ribbon) is position:FIXED DOM styled via individual style setters.
+ * Native <input type=range> is dead in Gameface — the scrubber is a div track + mouse drag.
+ * Markers are DOM (not canvas) because every canvas fill/stroke leaks one of Coherent's 49152
+ * static-resource pool items and never frees it — see the KNOWN ISSUE note at the canvas-draw section.
  *
  * Storage: reads the GAME config store (Configuration.getGame) written by rewind-recorder.js — a global
  * frame index (gi) across all ages; keep the schema in sync with the recorder.
@@ -234,9 +236,11 @@ function visForPos() {
   return curVis;
 }
 // Per-player HISTORICAL identity at frame gi (from the delta-coded `idd` in the players store) →
-// Map(pid -> [leader, civ, adjective, primaryInt, secondaryInt]). Civ/colors change at age transitions
-// (e.g. Aksum → Abbasid), so this lets each age show the civ that was actually played then, instead of the
-// player's CURRENT civ. Fields are already Locale-composed strings / raw color ints from record time.
+// Map(pid -> [leader, civ, adjective, primaryInt, secondaryInt, civType, csType]). Civ/colors change at
+// age transitions (e.g. Aksum → Abbasid), so this lets each age show the civ that was actually played
+// then, instead of the player's CURRENT civ — and lets dispersed city-states (Players.get null) keep
+// their recorded name/class. Fields are Locale-composed strings / raw color ints from record time;
+// csType (city-state class code) is absent in recordings made before 2026-07-09.
 const playersCache = new Map();   // gi -> parsed players record { t, s, vp, idd }
 function readPlayersRec(gi) {
   if (playersCache.has(gi)) return playersCache.get(gi);
@@ -250,7 +254,7 @@ function reconstructIdentity(targetGi) {
   let snap = -1;
   for (let g = targetGi; g >= 0; g--) if (frames[g] && frames[g][2] === 1) { snap = g; break; }   // nearest snapshot ≤ targetGi
   if (snap < 0) return m;
-  const apply = (rec, isSnap) => { if (!rec) return; if (isSnap) m.clear(); if (Array.isArray(rec.idd)) for (const e of rec.idd) { if (e.length <= 1) m.delete(e[0]); else m.set(e[0], [e[1], e[2], e[3], e[4], e[5], e[6]]); } };
+  const apply = (rec, isSnap) => { if (!rec) return; if (isSnap) m.clear(); if (Array.isArray(rec.idd)) for (const e of rec.idd) { if (e.length <= 1) m.delete(e[0]); else m.set(e[0], e.slice(1)); } };
   apply(readPlayersRec(snap), true);
   for (let g = snap + 1; g <= targetGi; g++) apply(readPlayersRec(g), false);
   return m;
@@ -355,20 +359,27 @@ function ownerMeta(owner) {
   // isMajor. Otherwise a city-state whose Players.get is null (removed/absorbed independent) or that
   // momentarily reports both isMinor and isIndependent false would fall through and render with MAJOR
   // styling (primary fill + secondary border → the teal-fill/black-border artifact).
-  let kind = 'citystate', dotType = '#dddddd', typeLabel = '';
+  let kind = 'citystate', dotType = '#dddddd', typeLabel = '', resolved = false;
   try {
     const pl = (typeof Players !== 'undefined' && Players.get) ? Players.get(owner) : null;
-    if (pl && pl.isMajor) kind = 'major';
-    else if (pl && pl.isBarbarian) kind = 'village';
+    if (pl && pl.isMajor) { kind = 'major'; resolved = true; }
+    else if (pl && pl.isBarbarian) { kind = 'village'; resolved = true; }
     else {
       kind = 'citystate';   // any non-major, non-barbarian (incl. unclassifiable / null) → independent power
       let def; try { if (pl && pl.getCityStateCityStateType) def = GameInfo.CityStateTypes.lookup(pl.getCityStateCityStateType()); } catch (e) {}
-      dotType = CITYSTATE_TYPE_COLOR[def && def.CityStateType] || '#dddddd';
-      typeLabel = csTypeLabel(def, def && def.CityStateType);
+      let code = def && def.CityStateType;
+      if (!code) {   // dispersed city-state: live lookup fails → recorded class (identity[6], absent pre-2026-07-09 recordings)
+        try { const id2 = identityForPos().get(owner); if (id2 && id2[6]) code = id2[6]; } catch (e) {}
+      }
+      dotType = CITYSTATE_TYPE_COLOR[code] || '#dddddd';
+      typeLabel = csTypeLabel(def, code);
+      resolved = !!code;
     }
   } catch (e) {}
   const meta = { kind, dotType, typeLabel };
-  ownerMetaCache.set(owner, meta);
+  // Don't cache an unresolved city-state (gray, unlabeled): the recorded class may become readable at a
+  // different frame (identity is per-pos), and a later call should get to retry.
+  if (resolved) ownerMetaCache.set(owner, meta);
   return meta;
 }
 
@@ -412,7 +423,7 @@ function measureArea() {
         let exitLeft = null, exitTop = null;
         const eb = document.getElementById(EXIT_EL_ID);
         if (eb) { const er = eb.getBoundingClientRect(); if (er && er.width > 0 && er.height > 0) { exitLeft = er.left; exitTop = er.top; } }
-        cachedPaneArea = mkArea(r.left, r.top, r.width, r.height, exitLeft, exitTop);
+        cachedPaneArea = mkArea(r.left, r.top, r.width, r.height, exitLeft, exitTop, true);   // pane=true
         return cachedPaneArea;
       }
     }
@@ -428,53 +439,382 @@ function measureArea() {
   const pad = lens.intrusion > 0 ? Math.max(margin, lens.intrusion - LENS_TIGHTEN) : margin;
   return mkArea(pad, top, Math.max(80, iw - 2 * pad), Math.max(80, bottom - top), null, null);
 }
-function mkArea(x, y, w, h, exitLeft, exitTop) {
+function mkArea(x, y, w, h, exitLeft, exitTop, pane) {
   const R = v => Math.round(v);
-  const a = { x: R(x), y: R(y), w: R(w), h: R(h), exitLeft: exitLeft != null ? R(exitLeft) : null, exitTop: exitTop != null ? R(exitTop) : null };
-  a.key = `${a.x},${a.y},${a.w},${a.h},${a.exitLeft},${a.exitTop}`;
+  const a = { x: R(x), y: R(y), w: R(w), h: R(h), exitLeft: exitLeft != null ? R(exitLeft) : null, exitTop: exitTop != null ? R(exitTop) : null, pane: !!pane };
+  a.key = `${a.x},${a.y},${a.w},${a.h},${a.exitLeft},${a.exitTop},${a.pane ? 1 : 0}`;
   return a;
 }
 let layoutDims = '';
 let backdrop = null;
-// The map is drawn across THREE stacked <canvas> layers, split along the static/dynamic seam so the
-// expensive static terrain leaves the per-turn path and each volatile layer can be redrawn (or one
-// day cached/patched) independently:
-//   bg    — static terrain (fog off) / flat hidden fill (fog on); redrawn only on layout or fog change.
-//   state — territory fills, borders, fog dim, resources, wonders; redrawn per turn.
-//   units — unit squares; redrawn per turn (densest, most volatile layer; own flush cadence).
-// A module-level mapCtx points at the layer being drawn, so the low-level path builders (which all draw
-// into mapCtx) stay unchanged. mapRoot aliases the bg element for existence/geometry guards.
-const bgLayer    = { id: 'rewind-map-bg',    z: 99991, el: null, ctx: null };
-const stateLayer = { id: 'rewind-map-state', z: 99992, el: null, ctx: null };
-const unitLayer  = { id: 'rewind-map-units', z: 99993, el: null, ctx: null };
-const LAYERS = [bgLayer, stateLayer, unitLayer];
+// The map is drawn across a FIXED, small set of canvases plus DOM layers for the per-tile markers. Every
+// canvas paint call permanently consumes ~1 item of Coherent's per-process 49,152 static-resource pool
+// (see the KNOWN ISSUE note), while clears, display swaps, and DOM mutation are measured FREE — so paints
+// happen only where recorded content actually changed:
+//   bg    — static terrain (fog off) / flat hidden fill (fog on); repainted only on layout or fog change.
+//   state — territory fills + fog dim + borders + capital stars, plus (fog on only) the vis-gated resource
+//           overlay and natural-wonder rings; repainted per position change, with a sequential-advance
+//           SKIP gate and a color-batched PARTIAL repaint (only the changed tiles) before any wholesale.
+//   res   — one canvas per age, painted once; shown when fog is OFF (swapped per age, pure show/hide).
+//   natw  — one canvas per game, painted once; shown when fog is OFF (winding-hole rings show the live
+//           map through the hole). Fog ON hides res+natw and draws their content in the state layer.
+//   DOM   — man-made wonders, city dots, unit markers: diffed per frame via certified-free style writes
+//           (position/color/opacity), never recreated.
+// A module-level mapCtx points at the canvas being painted, so the low-level path builders stay
+// unchanged. mapRoot aliases the bg element for existence/geometry guards.
+const bgLayer    = { id: 'rewind-map-bg',    z: 99981, el: null, ctx: null };
+const stateLayer = { id: 'rewind-map-state', z: 99982, el: null, ctx: null };
+const LAYERS = [bgLayer, stateLayer];
+// Per-age / per-game painted-once canvases. byAge maps a key (ageId for res; 0 for the single natw canvas)
+// to a slot painted exactly once; showing one is a display swap. Under FOG both are hidden and their
+// content is drawn vis-gated in the state layer (a static canvas can't respect per-frame visibility).
+function mkAgedLayer(id, z) { return { id, z, byAge: new Map(), spare: [], el: null }; }
+const resLayer  = mkAgedLayer('rewind-map-res',  99984);   // resources: constant within an age
+const natwLayer = mkAgedLayer('rewind-map-natw', 99986);   // natural wonders: constant for the whole game
+// DOM marker containers: man-made wonder triangles (border-trick divs; drawWonderLayer skips fog-hidden
+// tiles), city dots (Borders toggle), unit markers on top; unitDom is the map's pointer target
+// (pointer-events:auto suppresses the live game's plot tooltip). Markers are reusable divs mutated with
+// certified-free ops (position/color/opacity-park; styled-element hide/show cycles measured free — harness
+// dispS, 150k cycles); never recreated.
+const wonDom  = { id: 'rewind-map-mmw',   z: 99985, el: null };
+const dotDom  = { id: 'rewind-map-dots',  z: 99988, el: null };
+const unitDom = { id: 'rewind-map-units', z: 99989, el: null };
 let mapRoot = null, mapVisible = false;
 let building = false, buildToken = 0, revealWhenBuilt = false;
 let showTerritory = true, showBorders = true;   // layer toggles: cell fills / boundary segments + center markers
 let showLeaders = true;                          // leader ribbon (top-right, over the map)
 let showResources = false;                       // resource overlay (hollow hex tinted by class), off by default
-let fogMode = false, suppressFog = false;        // fog-of-war overlay (default per launch context: on in-game, off at endgame)
+let fogMode = false, suppressFog = false;        // fog-of-war overlay (defaults ON at every map open; see setFogFromContext)
+let fogLocked = false;                           // multiplayer + game-in-progress: fog is forced ON and the toggle is disabled (no scouting the replay)
+function isMultiplayerGame() { try { const g = (typeof Configuration !== 'undefined' && Configuration.getGame) ? Configuration.getGame() : null; return !!(g && g.isAnyMultiplayer); } catch (e) { return false; } }
+// Is the game genuinely OVER for the local player (defeated / a victory claimed / the final age has ended)?
+// Drives the MP fog lock: keyed on this rather than endgameMode, because the Victories→Rewind tab is
+// reachable MID-game (endgameMode=true there), which would otherwise let a MP player scout via the replay.
+// Any failure returns false (still-playing) → stays LOCKED, the safe anti-scout direction.
+function isLocalGameOver() {
+  try {
+    const vm = (typeof Game !== 'undefined') ? Game.VictoryManager : null;
+    if (vm) {
+      if (typeof vm.getLatestPlayerDefeat === 'function' && typeof GameContext !== 'undefined') {
+        const d = vm.getLatestPlayerDefeat(GameContext.localPlayerID);
+        if (d != null && (typeof DefeatTypes === 'undefined' || d !== DefeatTypes.NO_DEFEAT)) return true;
+      }
+      if (typeof vm.getVictories === 'function') { const v = vm.getVictories(); if (v && v.length) return true; }
+    }
+    const ap = (typeof Game !== 'undefined') ? Game.AgeProgressManager : null;
+    if (ap && ap.isFinalAge && ap.isAgeOver) return true;
+  } catch (e) {}
+  return false;
+}
 let bgDirty = true, bgFog = null;                // bg needs a (re)render; bgFog = the fog state the bg was last drawn with
 function makeLayerEl(L) {
   const c = document.createElement('canvas'); c.id = L.id;
-  // Only the TOP layer is the pointer target (so it suppresses the live-map plot tooltip); lower layers
-  // pass events through. The bg layer carries the deep-ocean backfill + frame; upper layers are transparent.
-  c.style.cssText = `position:fixed;pointer-events:${L === unitLayer ? 'auto' : 'none'};z-index:${L.z};display:${mapVisible ? 'block' : 'none'};`;
+  // Canvases pass pointer events through; the unit container above them is the map's pointer target.
+  // The bg layer carries the deep-ocean backfill + frame; upper layers are transparent.
+  c.style.cssText = `position:fixed;pointer-events:none;z-index:${L.z};display:${mapVisible ? 'block' : 'none'};`;
   return c;
 }
+// BACKGROUND — Coherent canvas static-resource leak: every canvas fill()/stroke() call permanently
+// registers ~1 item of the per-process 49,152 "static resource" pool (dense real workloads amortize to
+// ~0.23/call) and nothing ever frees it; see the KNOWN ISSUE note at the canvas-draw section. The renderer
+// minimizes paint calls (DOM markers for volatile content, skip gate + color-batched partial repaints for
+// the state canvas) so a normal session stays far under the cap. There is no runtime budget guard — if a
+// user somehow scrubs enough to exhaust the pool the game crashes, same as any canvas-heavy Gameface mod.
+// Leak-hunt instrumentation + on-screen test panel (the "LEAK TEST" strip + [REWIND] HB heartbeat), kept
+// behind this flag for easy re-enabling. Set false for release: contexts are then left un-instrumented
+// (zero per-call overhead) and the HB.* counters stay idle.
+const LT_ENABLED = false;
+const HB = { draws: 0, spaints: 0, walks: 0, fills: 0, strokes: 0, subs: 0, marks: 0, moves: 0, mhides: 0, ribs: 0, rimg: 0, tips: 0, t0: Date.now() };
+function instrumentCtx(ctx) {
+  if (!LT_ENABLED) return;   // no wrapping in release → canvas ops run at native speed
+  const f = ctx.fill.bind(ctx), s = ctx.stroke.bind(ctx), m = ctx.moveTo.bind(ctx);
+  ctx.fill = function () { HB.fills++; return f.apply(null, arguments); };
+  ctx.stroke = function () { HB.strokes++; return s.apply(null, arguments); };
+  ctx.moveTo = function (x, y) { HB.subs++; return m(x, y); };
+}
+
+// === LEAK-TEST HARNESS (gated by LT_ENABLED; false in release) =========================================
+// Isolates WHICH operation consumes the 49,152 static-resource pool: pick a mode from the on-screen "LEAK
+// TEST" panel (visible while the map is open), then leave the game idle. The harness issues that one
+// operation at a fixed rate against dedicated tiny-but-visible elements (bottom-left corner; they must be
+// visible — Cohtml doesn't rasterize occluded/offscreen content). Per-op leak rate = 49,152 / ops-at-crash
+// (read `test=` in the last [REWIND] HB line). A mode that survives ~20 min at 500 ops/s (~600k ops) is
+// clean at <0.08/op. Most modes auto-stop after 25 min; the scrub/sweep soak modes run until clicked off.
+let ltMode = 'off', ltOps = 0, ltTimer = null, ltStartMs = 0;
+let ltCanvas = null, ltCtx = null, ltTextEl = null, ltWideEl = null, ltDispEl = null, ltDispSEl = null, ltPanel = null, ltStatus = null;
+let ltCvShowEl = null;   // pre-painted canvas for the cvShow mode (display-cycled; pattern painted ONCE)
+let ltManyCvs = null;    // cvMany mode: N map-sized canvases, each painted once — the per-frame-cache VRAM smoke test
+const LT_RATES = { base: 0, scrub: 20, scrubR: 20, scrubT: 0, sweep: 20, fillS: 500, fillC: 500, fillG: 500, strk: 500, clear: 500, dstOut: 500, putImg: 200, text: 200, width: 200, disp: 200, dispS: 200, cvShow: 200, cvMany: 5, decay: 500 };
+// Seeded PRNG (mulberry32) for the scrub mode: same seed + same recording = the same jump sequence every
+// run, so pipeline changes can be compared crash-to-crash on identical workloads.
+let ltRand = null;
+function ltMulberry(seed) { let a = seed >>> 0; return () => { a = (a + 0x6D2B79F5) >>> 0; let t = a; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
+let ltImgData = null;   // reused ImageData for the putImg mode (the candidate fill/stroke-free renderer)
+let ltSweepDir = 1, ltSweepLast = 0;
+function ltOp(k) {
+  switch (ltMode) {
+    case 'sweep': {   // ping-pong: sequential playback forward then backward at 4x speed (100ms/turn) —
+                      // the realistic replay workload (ticks at 20/s; steps gated to the 4x cadence).
+      const now = Date.now();
+      if (now - ltSweepLast < PLAY_SPEEDS[2]) break;
+      ltSweepLast = now;
+      if (frames.length && cellByIndex) {
+        let next = pos + ltSweepDir;
+        if (next >= frames.length) { ltSweepDir = -1; next = Math.max(0, frames.length - 2); }
+        if (next < 0) { ltSweepDir = 1; next = Math.min(frames.length - 1, 1); }
+        goToIndex(next);
+      }
+      break;
+    }
+    case 'scrub':   // deterministic random scrubbing through the REAL pipeline (goToIndex = full redraw +
+    case 'scrubR':  // controls + ribbon), at ~hard-drag rate — the end-to-end calibration workload.
+      if (frames.length && cellByIndex) goToIndex((ltRand() * frames.length) | 0);
+      break;
+    case 'fillS': ltCtx.beginPath(); ltCtx.rect(2, 2, 20, 20); ltCtx.fillStyle = '#3a6ea5'; ltCtx.fill(); break;
+    case 'decay':   // pool-reclamation probe: 60s bursts of fillS (30k fills each) separated by 300s idle.
+                    // No decay → crash ~64s into burst #2 (t≈7min). Reclaim ≥30k/5min → survives auto-stop.
+                    // Partial → crash in burst #3-4; burst count at death measures the reclaim rate.
+                    // (Only in-burst iterations issue a fill; the ops counter keeps ticking for pacing.)
+      if (((Date.now() - ltStartMs) / 1000) % 360 < 60) { ltCtx.beginPath(); ltCtx.rect(2, 2, 20, 20); ltCtx.fillStyle = '#3a6ea5'; ltCtx.fill(); }
+      break;
+    case 'fillC': ltCtx.beginPath(); ltCtx.rect(2, 2, 20, 20); ltCtx.fillStyle = `rgb(${k % 251},${(k * 7) % 251},${(k * 13) % 251})`; ltCtx.fill(); break;
+    case 'fillG': ltCtx.beginPath(); ltCtx.rect(1 + (k % 5), 1 + ((k * 3) % 5), 4 + (k % 16), 4 + ((k * 7) % 16)); ltCtx.fillStyle = '#3a6ea5'; ltCtx.fill(); break;
+    case 'strk':  ltCtx.beginPath(); ltCtx.moveTo(2, 2); ltCtx.lineTo(22, 22); ltCtx.strokeStyle = '#3a6ea5'; ltCtx.lineWidth = 2; ltCtx.stroke(); break;
+    case 'dstOut':  // destination-out erase (shape-keyed "undo" for incremental repaint). 1:1 with normal
+                    // fills, same timing readout as `clear`: ~98s = erases cost ~1/call, ~197s = free.
+                    // VISUAL support check: corner square flickering blue/empty = erases work; solid blue =
+                    // composite op ignored by Cohtml → the whole erase idea is off the table.
+      if (k & 1) { ltCtx.globalCompositeOperation = 'destination-out'; ltCtx.beginPath(); ltCtx.rect(2, 2, 20, 20); ltCtx.fillStyle = '#000'; ltCtx.fill(); ltCtx.globalCompositeOperation = 'source-over'; }
+      else { ltCtx.beginPath(); ltCtx.rect(2, 2, 20, 20); ltCtx.fillStyle = '#3a6ea5'; ltCtx.fill(); }
+      break;
+    case 'clear':   // clearRect isolation — the op incremental repaints lean on. STRICT 1:1 fill/clear
+                    // alternation: every clear follows a fill, so an "empty canvas clear" no-op
+                    // optimization can't hide a leak. The known ~1/call fill rate is the clock: crash at
+                    // ~49k ops (~197s) = clears clean; ~24.5k ops (~98s) = clears leak ~1/call too;
+                    // between = partial (rate = 49152/(ops/2) - 1). Every branch crashes — no ambiguity.
+      if (k & 1) ltCtx.clearRect(0, 0, 24, 24);
+      else { ltCtx.beginPath(); ltCtx.rect(2, 2, 20, 20); ltCtx.fillStyle = '#3a6ea5'; ltCtx.fill(); }
+      break;
+    case 'putImg': {   // pixel upload, varying content — the fill/stroke-free rendering candidate
+      if (!ltImgData) {
+        // Cohtml's 2D context lacks createImageData; probe every route to a pixel buffer before giving up.
+        try { if (typeof ltCtx.createImageData === 'function') ltImgData = ltCtx.createImageData(24, 24); } catch (e) {}
+        try { if (!ltImgData && typeof ImageData !== 'undefined') ltImgData = new ImageData(24, 24); } catch (e) {}
+        try { if (!ltImgData && typeof ImageData !== 'undefined') ltImgData = new ImageData(new Uint8ClampedArray(24 * 24 * 4), 24, 24); } catch (e) {}
+        if (!ltImgData || typeof ltCtx.putImageData !== 'function') {
+          console.error(`${TAG} putImg UNSUPPORTED: createImageData=${typeof ltCtx.createImageData} putImageData=${typeof ltCtx.putImageData} ImageData=${typeof ImageData} getImageData=${typeof ltCtx.getImageData}`);
+          ltStart('off');
+          if (ltStatus) ltStatus.textContent = 'putImg UNSUPPORTED';
+          return;
+        }
+      }
+      const d = ltImgData.data, v = k % 251;
+      for (let p = 0; p < d.length; p += 4) { d[p] = v; d[p + 1] = (v * 7) % 251; d[p + 2] = (v * 13) % 251; d[p + 3] = 255; }
+      ltCtx.putImageData(ltImgData, 0, 0); break;
+    }
+    case 'text':  ltTextEl.textContent = 'T' + k; break;
+    case 'width': ltWideEl.style.width = (2 + (k % 40)) + 'px'; break;
+    case 'disp':  ltDispEl.style.display = (k & 1) ? 'none' : 'block'; break;    // plain div; a hide+show cycle = 2 ops
+    case 'dispS': ltDispSEl.style.display = (k & 1) ? 'none' : 'block'; break;   // ribbon-like styled div (border/radius/shadow)
+    case 'cvMany': {   // per-frame-canvas cache smoke test: 40 map-sized canvases painted once, visibility
+                       // cycled at 5/s. Watches for VRAM trouble (crash, corruption, FPS collapse) rather
+                       // than pool math — pool cost is just the one-time ~3 paints per canvas (~120 items).
+      if (!ltManyCvs) {
+        ltManyCvs = [];
+        const w = mapPxW > 0 ? Math.round(mapPxW) : 1200, h = mapPxH > 0 ? Math.round(mapPxH) : 900;
+        for (let n = 0; n < 40; n++) {
+          const cv = document.createElement('canvas'); cv.width = w; cv.height = h;
+          cv.style.cssText = `position:fixed;left:120px;top:120px;width:${w}px;height:${h}px;z-index:2000008;display:none;pointer-events:none;`;
+          document.body.appendChild(cv);
+          try {   // painted exactly once: full tint + two distinguishing shapes so cycling is visible
+            const c = cv.getContext('2d');
+            c.fillStyle = `rgb(${(n * 37) % 200 + 30},${(n * 71) % 200 + 30},${(n * 113) % 200 + 30})`; c.fillRect(0, 0, w, h);
+            c.fillStyle = '#ffffff'; c.fillRect((n * 29) % (w - 60), (n * 53) % (h - 60), 60, 60);
+            c.fillStyle = '#101418'; c.fillRect(w / 2 - 40, h / 2 - 40, 80, 80);
+          } catch (e) {}
+          ltManyCvs.push(cv);
+        }
+      }
+      for (let n = 0; n < ltManyCvs.length; n++) ltManyCvs[n].style.display = (n === k % ltManyCvs.length) ? 'block' : 'none';
+      break;
+    }
+    case 'cvShow':  // display-cycle a canvas painted ONCE (10 fills at creation, never repainted). Crash at
+                    // ~50s = re-show replays the command buffer (~10 items/show); ~8min = ~1/show (texture
+                    // re-registration); survives = free. AFTER the run: pattern still visible = content
+                    // survives hiding; blank = Cohtml drops hidden canvas backings → per-age canvases dead.
+      ltCvShowEl.style.display = (k & 1) ? 'none' : 'block'; break;
+  }
+}
+function ltEnsureEls() {
+  if (ltCanvas) return;
+  ltCanvas = document.createElement('canvas'); ltCanvas.width = 24; ltCanvas.height = 24;
+  // Hot-pink backing: erased/cleared regions show PINK through the canvas. dstOut visual verdict: square
+  // flashing pink/purple = destination-out works; solid dark blue = composite op ignored (#000 erase-fills).
+  ltCanvas.style.cssText = 'position:fixed;left:4px;bottom:44px;width:24px;height:24px;z-index:2000009;background-color:#ff00ff;pointer-events:none;';
+  ltCtx = ltCanvas.getContext('2d');   // deliberately NOT instrumented — the harness counts its own ops via ltOps
+  ltTextEl = document.createElement('div');
+  ltTextEl.style.cssText = 'position:fixed;left:32px;bottom:52px;z-index:2000009;color:#888;font-size:10px;pointer-events:none;';
+  ltTextEl.textContent = 'T0';
+  ltWideEl = document.createElement('div');
+  ltWideEl.style.cssText = 'position:fixed;left:32px;bottom:44px;height:4px;width:2px;z-index:2000009;background-color:#888;pointer-events:none;';
+  ltDispEl = document.createElement('div');
+  ltDispEl.style.cssText = 'position:fixed;left:80px;bottom:44px;width:14px;height:14px;z-index:2000009;background-color:#666;pointer-events:none;';
+  ltDispSEl = document.createElement('div');   // ribbon-row-like: border + radius + shadow (generated imagery)
+  ltDispSEl.style.cssText = 'position:fixed;left:100px;bottom:44px;width:14px;height:14px;z-index:2000009;background-color:#446;border:2px solid #6a88bb;border-radius:4px;box-shadow:0 1px 4px rgba(0,0,0,0.6);pointer-events:none;';
+  ltCvShowEl = document.createElement('canvas'); ltCvShowEl.width = 16; ltCvShowEl.height = 16;
+  ltCvShowEl.style.cssText = 'position:fixed;left:120px;bottom:44px;width:16px;height:16px;z-index:2000009;background-color:#222;pointer-events:none;';
+  try {   // checker pattern, painted exactly once — never repainted by the mode
+    const c = ltCvShowEl.getContext('2d');
+    for (let q = 0; q < 10; q++) { c.beginPath(); c.rect((q % 4) * 4, ((q / 4) | 0) * 4, 4, 4); c.fillStyle = (q & 1) ? '#3a6ea5' : '#e8e8e8'; c.fill(); }
+  } catch (e) {}
+  document.body.appendChild(ltCanvas); document.body.appendChild(ltTextEl); document.body.appendChild(ltWideEl);
+  document.body.appendChild(ltDispEl); document.body.appendChild(ltDispSEl); document.body.appendChild(ltCvShowEl);
+}
+function ltMaxMs() { return (ltMode === 'scrub' || ltMode === 'scrubR' || ltMode === 'scrubT' || ltMode === 'sweep') ? Infinity : 25 * 60000; }   // scrub/sweep soaks run until clicked off
+function ltStart(mode) {
+  ltEnsureEls();
+  if (ltTimer) { clearInterval(ltTimer); ltTimer = null; }
+  const prevMode = ltMode, prevOps = ltOps;
+  ltMode = mode; ltOps = 0; ltStartMs = Date.now();
+  if (ltCvShowEl) ltCvShowEl.style.display = 'block';   // end any cvShow run visible, so the pattern-survival verdict can be read
+  if (ltManyCvs && mode !== 'cvMany') for (const cv of ltManyCvs) cv.style.display = 'none';   // leaving cvMany → hide the big test canvases
+  if (mode === 'scrub' || mode === 'scrubR' || mode === 'scrubT') { ltRand = ltMulberry(20260709); try { pause(); } catch (e) {} }   // fixed seed → reproducible jump sequence
+  if (mode === 'sweep') { ltSweepDir = 1; ltSweepLast = 0; try { pause(); } catch (e) {} }
+  console.error(`${TAG} LEAK TEST mode=${mode} rate=${LT_RATES[mode] || 0}/s${mode === 'off' && prevMode !== 'off' ? ` (ended ${prevMode} at ops=${prevOps} after ${Math.round((Date.now() - HB.t0) / 1000)}s uptime)` : ''}`);
+  ltUpdatePanel();
+  if (mode === 'off') {
+    // Keep the ended run's final count on screen (the full time series is in UI.log's HB lines anyway).
+    if (ltStatus && prevMode !== 'off') ltStatus.textContent = `off (${prevMode} ended: ops=${prevOps})`;
+    return;
+  }
+  if (mode === 'scrubR') {   // rAF-paced twin of `scrub` (same seed/rate): isolates scheduler-context call
+                             // pricing — timer-context draws measured ~1/call, rAF-context (real dragging) ~0.23.
+    const tick = () => {
+      if (ltMode !== 'scrubR') return;
+      if (Date.now() - ltStartMs > ltMaxMs()) { ltStart('off'); return; }
+      const due = ((Date.now() - ltStartMs) / 50) | 0;   // 20 ops/s wall-clock, paced inside animation frames
+      if (ltOps < due) ltOp(ltOps++);                    // max ONE draw per animation frame, like real drag coalescing
+      if (ltStatus) ltStatus.textContent = `${ltMode} ops=${ltOps}`;
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+    return;
+  }
+  if (mode === 'scrubT') {   // realistic drag emulator: drives the REAL input path (seeking flag +
+                             // scheduleSeek/renderSeekTarget coalescing + release/re-grab gestures) with a
+                             // seeded cursor random walk over the actual track — variable-speed sweeps,
+                             // hold-still pauses, occasional releases (which fire the deferred ribbon
+                             // rebinds exactly like a human letting go of the mouse).
+    let phase = 'drag', phaseUntil = 0, x = 0, v = 0, last = 0;
+    const trackBox = () => { try { return els.track.getBoundingClientRect(); } catch (e) { return null; } };
+    const newSegment = (t) => {
+      const r = ltRand();
+      if (r < 0.70) { phase = 'drag'; v = (ltRand() < 0.5 ? -1 : 1) * (30 + ltRand() * 1170); phaseUntil = t + 300 + ltRand() * 2700; }
+      else if (r < 0.90) { phase = 'pause'; v = 0; phaseUntil = t + 300 + ltRand() * 1700; }                     // still held down
+      else { phase = 'released'; try { onSeekEnd({ clientX: x }); } catch (e) {} phaseUntil = t + 200 + ltRand() * 800; }
+    };
+    const tick = () => {
+      if (ltMode !== 'scrubT') return;
+      const t = Date.now();
+      if (t - ltStartMs > ltMaxMs()) { try { onSeekEnd({ clientX: x }); } catch (e) {} ltStart('off'); return; }
+      const box = trackBox();
+      if (box && box.width > 0) {
+        if (!last) { last = t; x = box.left + ltRand() * box.width; try { onSeekStart({ clientX: x, preventDefault: () => {} }); } catch (e) {} newSegment(t); }
+        const dt = Math.min(100, t - last) / 1000; last = t;
+        if (t >= phaseUntil) {
+          if (phase === 'released') { try { onSeekStart({ clientX: x, preventDefault: () => {} }); } catch (e) {} }
+          newSegment(t);
+        }
+        if (phase === 'drag') {
+          x += v * dt;
+          if (x < box.left) { x = box.left; v = Math.abs(v); }
+          if (x > box.left + box.width) { x = box.left + box.width; v = -Math.abs(v); }
+          onSeekMove({ clientX: x }); ltOps++;
+        }
+      }
+      if (ltStatus) ltStatus.textContent = `${ltMode} ops=${ltOps}`;
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+    return;
+  }
+  const rate = LT_RATES[mode] || 0;
+  ltTimer = setInterval(() => {
+    if (Date.now() - ltStartMs > ltMaxMs()) { ltStart('off'); return; }   // auto-stop (scrub soaks: none — stop by clicking off)
+    for (let i = 0; i < rate / 20; i++) ltOp(ltOps++);
+    if (ltStatus) ltStatus.textContent = `${ltMode} ops=${ltOps}`;
+  }, 50);
+}
+function ltUpdatePanel() {
+  if (!ltPanel) return;
+  for (const b of ltPanel.__btns) b.style.backgroundColor = (b.__mode === ltMode) ? '#3a6ea5' : '#333';
+  if (ltStatus) ltStatus.textContent = `${ltMode} ops=${ltOps}`;
+}
+function ltEnsurePanel() {
+  if (!LT_ENABLED) return;
+  if (ltPanel) { ltPanel.style.display = 'flex'; return; }
+  ltPanel = document.createElement('div');
+  ltPanel.style.cssText = 'position:fixed;left:4px;bottom:4px;z-index:2000010;display:flex;flex-direction:row;gap:4px;align-items:center;background:rgba(16,22,34,0.9);border:1px solid #555;border-radius:4px;padding:4px 6px;pointer-events:auto;';
+  const title = document.createElement('div');
+  title.textContent = 'LEAK TEST:'; title.style.cssText = 'color:#aaa;font-size:11px;';
+  ltPanel.appendChild(title);
+  ltPanel.__btns = [];
+  for (const mode of ['off', 'base', 'scrub', 'scrubR', 'scrubT', 'sweep', 'fillS', 'fillC', 'fillG', 'strk', 'clear', 'dstOut', 'putImg', 'text', 'width', 'disp', 'dispS', 'cvShow', 'cvMany', 'decay']) {
+    const b = document.createElement('div');
+    b.textContent = mode; b.__mode = mode;
+    b.style.cssText = 'color:#eee;font-size:11px;padding:2px 7px;border-radius:3px;background-color:#333;cursor:pointer;';
+    b.onclick = () => ltStart(mode);
+    ltPanel.appendChild(b); ltPanel.__btns.push(b);
+  }
+  ltStatus = document.createElement('div');
+  ltStatus.style.cssText = 'color:#7f7;font-size:11px;margin-left:6px;';
+  ltStatus.textContent = 'off ops=0';
+  ltPanel.appendChild(ltStatus);
+  document.body.appendChild(ltPanel);
+}
+// === END TEMP LEAK-TEST HARNESS =========================================================================
+try { if (LT_ENABLED) setInterval(() => { if (mapVisible || ltMode !== 'off') console.error(`[REWIND] HB up=${Math.round((Date.now() - HB.t0) / 1000)}s fog=${fogMode ? 1 : 0} draws=${HB.draws} spaints=${HB.spaints} walks=${HB.walks} fills=${HB.fills} strokes=${HB.strokes} subs=${HB.subs} marks=${HB.marks} moves=${HB.moves} mhides=${HB.mhides} ribs=${HB.ribs} rimg=${HB.rimg} tips=${HB.tips} test=${ltMode}:${ltOps}`); }, 5000); } catch (e) {}
 function ensureMapRoot() {
   for (const L of LAYERS) {
     if (!L.el) {
       L.el = makeLayerEl(L);
       document.body.appendChild(L.el);
-      try { L.ctx = L.el.getContext('2d'); } catch (e) { err(`canvas ctx ${L.id}: ${e}`); }
+      try { L.ctx = L.el.getContext('2d'); if (L.ctx) instrumentCtx(L.ctx); } catch (e) { err(`canvas ctx ${L.id}: ${e}`); }
     }
+  }
+  for (const dom of [wonDom, dotDom]) {
+    if (!dom.el) {
+      const d = document.createElement('div'); d.id = dom.id;
+      d.style.cssText = `position:fixed;overflow:hidden;z-index:${dom.z};opacity:${mapVisible ? 1 : 0};pointer-events:none;`;
+      document.body.appendChild(d);
+      dom.el = d;
+    }
+  }
+  if (!unitDom.el) {
+    const d = document.createElement('div'); d.id = unitDom.id;
+    // pointer-events:auto = the map's cursor target (suppresses the live-map plot tooltip); overflow:hidden
+    // clips edge markers to the map rect, matching the old canvas bounds. Hidden via OPACITY, not display —
+    // a display cycle on the container would re-rasterize every visible marker child on reopen (~1 static
+    // pool item each; see the units-layer note). pointer-events flips with visibility so the hidden
+    // container doesn't eat the live game's clicks.
+    d.style.cssText = `position:fixed;overflow:hidden;z-index:${unitDom.z};opacity:${mapVisible ? 1 : 0};pointer-events:${mapVisible ? 'auto' : 'none'};`;
+    document.body.appendChild(d);
+    unitDom.el = d;
   }
   mapRoot = bgLayer.el; mapCtx = bgLayer.ctx;
   return bgLayer.el;
 }
 function markBgDirty() { bgDirty = true; }
-function setMapVisible(on) { mapVisible = on; ensureMapRoot(); for (const L of LAYERS) if (L.el) L.el.style.display = on ? 'block' : 'none'; syncCheckbox(on); }
+function setMapVisible(on) {
+  mapVisible = on; ensureMapRoot();
+  for (const L of LAYERS) if (L.el) L.el.style.display = on ? 'block' : 'none';
+  syncLayerDisplays();                                                       // shown cached canvases follow visibility + their toggles
+  if (dotDom.el) dotDom.el.style.opacity = on ? '1' : '0';
+  if (wonDom.el) wonDom.el.style.opacity = on ? '1' : '0';
+  if (unitDom.el) { unitDom.el.style.opacity = on ? '1' : '0'; unitDom.el.style.pointerEvents = on ? 'auto' : 'none'; }
+  try { if (on) ltEnsurePanel(); else if (ltPanel && ltMode === 'off') ltPanel.style.display = 'none'; } catch (e) {}   // TEMP leak-test harness UI
+  syncCheckbox(on);
+}
 // Keep the injected "Rewind" minimap checkbox in step with the map's visibility. Guarded so the
 // programmatic attribute change doesn't loop back through our component-value-changed handler.
 let suppressCheckbox = false;
@@ -486,9 +826,10 @@ function syncCheckbox(on) {
   suppressCheckbox = true;
   try { cb.setAttribute('selected', want); } finally { suppressCheckbox = false; }
 }
-// Canvas renderer: the whole map is drawn into the three stacked <canvas> layers above (LAYERS). This
-// replaces the old ~4k-div overlay, so there are only a few nodes to composite — idle/hover never
-// re-lays-out or re-rasters a huge DOM, and a frame change is just ctx redraws.
+// Canvas renderer: terrain, per-turn state, per-age resources and natural wonders are drawn into the
+// canvas layers above; man-made wonders, city dots and units are DOM markers. The canvases replace the
+// old ~4k-div tile overlay, so idle/hover never re-lays-out a huge DOM, and a frame change is a small
+// state repaint (often just the changed tiles) plus a marker diff.
 let mapCtx = null;                  // 2D context of the map canvas
 let mapDpr = 1;                     // device-pixel ratio the canvas backing store is sized for
 let curFrame = null;                // last drawn frame Map
@@ -509,15 +850,25 @@ function computeLayout(w, h, area) {
   maxCol = 0; maxRow = 0;
   for (let i = 0; i < n; i++) { const l = GameplayMap.getLocationFromIndex(i); colrow[i] = { c: l.x, r: l.y }; if (l.x > maxCol) maxCol = l.x; if (l.y > maxRow) maxRow = l.y; }
   const W = maxCol + 1;
-  // The map fills the area above the scrub band; when an Exit button is present the scrub band starts
-  // at its top (so the map clears the button and the scrub sits beside it). Height is the real limit.
+  // Victories PANE (mid- OR end-game): the map + scrub bar together fill the pane, scrub directly below the
+  // map (no overlap). Reserve the real scrub-panel height so the map is sized to the rest, and center the
+  // (map + scrub) BLOCK as a unit (below) so there's no empty band. Same for both, so the layout is
+  // identical whether or not the game is over. In the full-screen in-game overlay there's no pane, so the
+  // fixed SCRUB_RESERVE bounds the scrub bar below the map.
   const sr = ps(SCRUB_RESERVE), pad = ps(LAYOUT_PAD);
-  const scrubBandTop = (area.exitTop != null) ? area.exitTop : (area.y + area.h - sr);
-  const fitTop = area.y + pad, fitBottom = scrubBandTop - pad;
-  const zoneH = Math.max(40, fitBottom - fitTop), zoneW = Math.max(40, area.w - 2 * pad);
-  // MAX_FILL leaves a margin so the map never fills edge-to-edge (matters when the map's aspect ≈
-  // the pane's, e.g. the largest map types, which otherwise look oversized).
-  const fitH = zoneH * MAX_FILL, fitW = zoneW * MAX_FILL;
+  // The scrub panel reports 0 height via getBoundingClientRect in Gameface (its custom-element children
+  // don't contribute layout height), so its height is COMPUTED from the pieces it's built from — vertical
+  // padding + control row (button height, the tallest child) + gap + timeline track — which scales with
+  // ps() on every display. Pane case fills SNUGLY (no inner pad, no MAX_FILL margin) so the map+scrub fills
+  // the whole pane, bounded by width or height per the aspect ratio.
+  const panelH = area.pane ? paneScrubReserve() : 0;
+  const pad2 = area.pane ? 0 : pad;
+  const fill2 = area.pane ? 1 : MAX_FILL;
+  const scrubBandTop = area.pane ? (area.y + area.h - panelH) : (area.y + area.h - sr);
+  const fitTop = area.y + pad2, fitBottom = scrubBandTop - pad2;
+  const zoneH = Math.max(40, fitBottom - fitTop), zoneW = Math.max(40, area.w - 2 * pad2);
+  // MAX_FILL (in-game only) leaves a margin so the map never fills edge-to-edge; the pane case fills fully.
+  const fitH = zoneH * fill2, fitW = zoneW * fill2;
   let hw = fitW / (maxCol + 1.5);
   const totalH = maxRow * (hw * 1.1547 * 0.75) + hw * 1.1547;
   if (totalH > fitH) hw *= fitH / totalH;
@@ -525,14 +876,11 @@ function computeLayout(w, h, area) {
   hexW = Math.round(hw); hexH = Math.round(hw * 1.1547); rowStep = hexH * 0.75;
   mapPxW = Math.ceil((maxCol + 1.5) * hexW); mapPxH = Math.ceil(maxRow * rowStep + hexH);
   mapX = Math.round(area.x + (area.w - mapPxW) / 2);                       // center horizontally in the area
-  if (area.exitTop != null) {
-    // Endgame Victories tab: the scrub bar sits beside the Exit button, so center the (map + scrub) block
-    // in the zone above that button (reserving sr shifts the map up to leave room for the scrub row).
-    mapY = Math.round(fitTop + Math.max(0, (zoneH - mapPxH - sr) / 2));
+  if (area.pane) {
+    // Center the (map + scrub) block vertically in the pane; the scrub sits flush below the map.
+    mapY = Math.round(area.y + Math.max(0, (area.h - mapPxH - panelH) / 2));
   } else {
-    // In-game overlay: center the MAP RECTANGLE itself vertically in the area (= screen). The scrub panel
-    // sits just below the map; the bottom band has room for it. (Reserving sr here would double-count the
-    // scrub space — the zone already excludes it — and bias the map upward.)
+    // In-game overlay: center the map rectangle in the (HUD-clear) area; the scrub floats below it.
     mapY = Math.round(area.y + Math.max(0, (area.h - mapPxH) / 2));
   }
   exitKeepoutX = area.exitLeft;                                           // positionPanel keeps the scrub left of this
@@ -582,12 +930,21 @@ function applyLayerBox(L) {
   }
   if (L.ctx) L.ctx.setTransform(mapDpr, 0, 0, mapDpr, 0, 0);
 }
+function applyUnitBox() {
+  for (const dom of [unitDom, dotDom, wonDom]) {
+    const d = dom.el; if (!d) continue;
+    d.style.left = mapX + 'px'; d.style.top = mapY + 'px';
+    d.style.width = mapPxW + 'px'; d.style.height = mapPxH + 'px';
+  }
+}
 function positionChrome() {
   ensureMapRoot();
   const dpr = (typeof window !== 'undefined' && window.devicePixelRatio) ? window.devicePixelRatio : 1;
   mapDpr = dpr;
   for (const L of LAYERS) applyLayerBox(L);
+  applyUnitBox();
   markBgDirty();     // the canvases were resized (which clears them) → the static bg must be repainted
+  resetUnitDom(); resetDotDom(); resetWonDom();   // marker positions/sizes depend on the layout → re-place them on the next draw
   positionPanel();
 }
 // place the scrubber directly below the map, horizontally centered on it
@@ -614,6 +971,10 @@ function fitGroupToBox(g, origin) {
   const box = g.clientWidth, content = g.scrollWidth;   // flex-allocated half vs natural content
   if (box > 0 && content > box + 1) { g.style.transformOrigin = origin + ' center'; g.style.transform = `scale(${box / content})`; }
 }
+// Deterministic scrub-panel height (getBoundingClientRect returns 0 in Gameface). Built in buildPanel as:
+// ps(10) vertical padding ×2 + control row (button box ps(BTN_H), the tallest child) + ps(6) gap +
+// ps(18) timeline track. Scales with ps() so the map+scrub fills the pane snugly on any display.
+function paneScrubReserve() { return ps(10) * 2 + ps(BTN_H) + ps(6) + ps(18); }
 function positionPanel() {
   if (!els.panel) return;
   const cx = mapX + mapPxW / 2;
@@ -627,38 +988,38 @@ function positionPanel() {
   // (the turn pill is positioned on scrubber hover, not here)
 }
 
-// --- canvas draw (BATCHED by color) ------------------------------------------------------------------
-// KNOWN ISSUE (mitigated 2026-07-08, not fully fixed): sustained aggressive scrubbing overflows Coherent's
-// 49152-item "static resource" pool and hard-crashes the game (Renderer.log: "PartitionedResourceList.
-// AddStaticResource(), attempting to add more than 49152 items"). Nothing frees the pool (clearRect,
-// canvas.width reset, element recreate, periodic layer recycling all failed). Instrumented A/B runs
-// attributed the leak to the UNIT LAYER's small one-shot beginPath/fill pairs (~0.3 pool items per call;
-// units-off scrubbing leaked ~nothing across 90k+ batched state-layer calls). NOT one-item-per-any-call
-// (250k+ calls ran per session = 5x the pool); NOT the leader ribbon (its separate DOM-recreation leak is
-// fixed in buildRibbon); rect() vs moveTo/lineTo made no difference.
-// MITIGATION shipped here: drawUnitLayer's full-repaint path batches unit fills by color, which cut the
-// leak ~3.6x — hard CONTINUOUS scrubbing now survives ~3,500 redraws per game session (vs ~970 unbatched);
-// normal playback/scrubbing doesn't get near that. A residual per-redraw leak remains; mechanism
-// unresolved (possibly per-subpath — batching didn't zero it).
-// Abandoned fixes, for the record (2026-07-08):
-//   • Frame cache (render each frame once, blit on scrub): LRU eviction reopens the leak on real
-//     (hundreds-of-turns) games, so it can't be the safety mechanism.
-//   • Glyph sprites (stamp pre-rendered unit/resource canvases via drawImage): Cohtml never rasterizes a
-//     canvas that isn't visibly painted — detached, offscreen-parked, and occluded-under-the-map sprite
-//     sheets all stamp BLACK — and drawImage from a backing-less canvas itself leaked ~1 per 50 calls.
-// Each layer is one persistent canvas cleared with clearRect each frame; the DPR transform persists
-// across clearRect (it's set once in applyLayerBox).
-function beginLayer(L) {
-  mapCtx = L.ctx; mapRoot = bgLayer.el;
-  mapCtx.clearRect(0, 0, mapPxW, mapPxH);
-}
+// --- canvas draw ------------------------------------------------------------------------------------
+// KNOWN ISSUE — Coherent canvas static-resource leak. Sustained scrubbing overflowed Coherent's
+// 49152-item "static resource" pool and hard-crashed the game (Renderer.log: "PartitionedResourceList.
+// AddStaticResource(), attempting to add more than 49152 items"). Isolated harness runs pinned the cause:
+// EVERY canvas fill()/stroke() call permanently registers ~1 pool item (dense real workloads amortize to
+// ~0.23/call via within-flush dedup), and NOTHING frees them — clearRect, canvas.width reset, element
+// recreate, display cycling, idle time all measured non-reclaiming; the one release API
+// (cohtml::View::QueueClearCaches) is C++-host-side and Civ 7 never exposes or calls it; there is no
+// pixel API (putImageData/getImageData/ImageData all undefined) and drawImage from an unpainted canvas
+// composites black. So the ONLY lever is issuing fewer paint calls. That shapes the whole renderer:
+//   • per-tile VOLATILE content (units, city dots, wonders) lives in DOM markers — mutating retained divs
+//     (position/color/opacity) is measured FREE; it never touches the pool.
+//   • canvas layers paint only where recorded content changed: the state layer skips unchanged sequential
+//     turns and otherwise repaints only the changed tiles' color groups (tryPartialState); bg/res/natw
+//     paint once. Fills MUST stay batched — one beginPath/fill|stroke per color group, never per shape;
+//     and subpaths within one path must not overlap in area (Cohtml fills EVEN-ODD → overlap punches
+//     holes). A normal session stays far under the 49152 cap; there is no runtime crash guard.
+// Abandoned fixes, for the record: a frame cache (blit each frame via drawImage — drawImage is broken as
+// above), glyph sprite sheets (Cohtml won't rasterize an unpainted source canvas), and a per-layer LRU
+// canvas cache (couldn't hold enough of a real game's states to matter, and added large complexity).
+// DPR: applyLayerBox sets the device-pixel transform once per layout; it persists across clearRect.
 // path builders (append to the CURRENT path; caller does beginPath/fill/stroke once per color)
 function hexSubpath(i) {
   const p = basePos[i], x = p.x, y = p.y, w = hexW, h = hexH;
   mapCtx.moveTo(x + 0.5 * w, y); mapCtx.lineTo(x + w, y + 0.25 * h); mapCtx.lineTo(x + w, y + 0.75 * h);
   mapCtx.lineTo(x + 0.5 * w, y + h); mapCtx.lineTo(x, y + 0.75 * h); mapCtx.lineTo(x, y + 0.25 * h); mapCtx.closePath();
 }
-// A hexagon shrunk toward the tile center by factor s (0..1) — used for the resource overlay's hollow hex.
+// NOTE (2026-07-10): the outset/overlap trick for closing carpet seams is DEAD — Cohtml fills paths with
+// EVEN-ODD semantics, so overlapping subpaths within one path punch HOLES along every shared edge (the
+// wider the overlap, the wider the visible gap). Carpets close their seams the proven way instead: exact
+// hexes + a same-color 1px stroke (fill+stroke per color group — see renderBackground/drawStateLayer).
+// A hexagon scaled about the tile center by factor s (<1 shrinks — resource overlay; >1 expands — outset fills).
 function insetHexSubpath(i, s) {
   const p = basePos[i], cx = p.x + 0.5 * hexW, cy = p.y + 0.5 * hexH;
   for (let k = 0; k < 6; k++) { const v = hexVert(i, k), vx = cx + (v[0] - cx) * s, vy = cy + (v[1] - cy) * s; if (k === 0) mapCtx.moveTo(vx, vy); else mapCtx.lineTo(vx, vy); }
@@ -671,28 +1032,74 @@ function hexVert(i, k) {   // hex vertex k: 0 top,1 upper-right,2 lower-right,3 
 const EDGE_VERTS = [[1, 2], [4, 5], [0, 1], [5, 0], [2, 3], [3, 4]];   // dir E,W,NE,NW,SE,SW -> hex vertex pair
 function edgeSubpath(i, dir) { const vp = EDGE_VERTS[dir], a = hexVert(i, vp[0]), b = hexVert(i, vp[1]); mapCtx.moveTo(a[0], a[1]); mapCtx.lineTo(b[0], b[1]); }
 function circleSubpath(cx, cy, r) { mapCtx.moveTo(cx + r, cy); mapCtx.arc(cx, cy, r, 0, 2 * Math.PI); }
-// Axis-aligned centered square (half-side r). Far cheaper than a circle to tessellate (2 tris vs ~16-32),
-// which matters for the unit layer — the densest, priciest per-frame layer late game (unit carpets).
-function squareSubpath(cx, cy, r) { mapCtx.rect(cx - r, cy - r, 2 * r, 2 * r); }
 const STAR_PTS = [[0.50, 0.00], [0.61, 0.35], [0.98, 0.35], [0.68, 0.57], [0.79, 0.91], [0.50, 0.70], [0.21, 0.91], [0.32, 0.57], [0.02, 0.35], [0.39, 0.35]];
 function starSubpath(cx, cy, r) { const x0 = cx - r, y0 = cy - r, d = 2 * r; for (let k = 0; k < STAR_PTS.length; k++) { const px = x0 + STAR_PTS[k][0] * d, py = y0 + STAR_PTS[k][1] * d; if (k === 0) mapCtx.moveTo(px, py); else mapCtx.lineTo(px, py); } mapCtx.closePath(); }
 function triSubpath(cx, cy, r) { const h = Math.round(2 * r * TRI_RATIO), top = cy - 2 * h / 3; mapCtx.moveTo(cx, top); mapCtx.lineTo(cx + r, top + h); mapCtx.lineTo(cx - r, top + h); mapCtx.closePath(); }
+// Counter-clockwise twin: appended after a CW triangle in the same path it punches a HOLE (works under
+// both winding rules), so the natural-wonder ring shows the live map through its center.
+function triSubpathCCW(cx, cy, r) { const h = Math.round(2 * r * TRI_RATIO), top = cy - 2 * h / 3; mapCtx.moveTo(cx, top); mapCtx.lineTo(cx - r, top + h); mapCtx.lineTo(cx + r, top + h); mapCtx.closePath(); }
 function pushGroup(map, key, val) { let g = map.get(key); if (!g) { g = []; map.set(key, g); } g.push(val); }
 // collect a tile's border edges + center marker into color-keyed groups (drawn batched later); city-state
 // ring edges go to edgesTop (a top layer) so they aren't overwritten at boundaries with other owners.
-function collectTileBorders(i, frame, edges, dots, stars, edgesTop) {
+// --- conquest tracking (border edge ownership) ---------------------------------------------------------
+// A tile is CONQUERED at frame F if it's urban (cls >= 1) and its owner differs from its FOUNDER — the
+// owner at its most recent not-urban -> urban transition at or before F. Episodes are built in one pass
+// over the recorded deltas (owner changes while urban = the conquest itself, founder unchanged; razing
+// ends an episode; a snapshot where the tile was already urban CONTINUES the episode, so conquered status
+// survives age transitions while ownership holds). Conquered tiles always draw their contested edges, so
+// a captured city's whole perimeter rings uniformly in the conqueror's color.
+let conquestEpisodes = null;   // plot -> [[startGi, founderOwner], ...] in gi order
+function buildConquestEpisodes() {
+  conquestEpisodes = new Map();
+  const curCls = new Map();
+  const startEp = (i, g, own) => { let a = conquestEpisodes.get(i); if (!a) { a = []; conquestEpisodes.set(i, a); } a.push([g, own]); };
+  for (let g = 0; g < frames.length; g++) {
+    const rec = readTurnCached(g); if (!rec || !rec.terr) continue;
+    if (rec.s === 1) {
+      const nCls = new Map();
+      for (const pv of rec.terr) { const t = unpackTerr(pv); if (t[1] >= 0) { nCls.set(t[0], t[2]); if (t[2] >= 1 && !((curCls.get(t[0]) || 0) >= 1)) startEp(t[0], g, t[1]); } }
+      curCls.clear(); for (const [i, cc] of nCls) curCls.set(i, cc);
+    } else {
+      for (const pv of rec.terr) {
+        const t = unpackTerr(pv), i = t[0];
+        if (t[1] < 0) { curCls.delete(i); continue; }
+        if (t[2] >= 1 && !((curCls.get(i) || 0) >= 1)) startEp(i, g, t[1]);
+        curCls.set(i, t[2]);
+      }
+    }
+  }
+}
+function founderAt(i, F) {
+  if (!conquestEpisodes) buildConquestEpisodes();
+  const a = conquestEpisodes.get(i); if (!a) return -1;
+  let f = -1;
+  for (const [g, own] of a) { if (g <= F) f = own; else break; }
+  return f;
+}
+function conqueredAt(i, owner) { const f = founderAt(i, pos); return f >= 0 && f !== owner; }
+
+// Border strokes: normal edges, then city-state rings on top. Contested edges facing an enemy URBAN
+// tile aren't double-drawn at all — the non-urban side SKIPS them (see collectTileBorders), so a captured
+// district's ring (capturer's color) wins without any extra stroke tier.
+function strokeBorderTiers(edges, edgesTop, stars, cx, cy) {
+  mapCtx.lineCap = 'round';
+  for (const tier of [edges, edgesTop]) {
+    for (const [color, segs] of tier) { mapCtx.beginPath(); for (const [i, d] of segs) edgeSubpath(i, d); mapCtx.strokeStyle = color; mapCtx.lineWidth = borderT; mapCtx.stroke(); }
+  }
+  const sr = Math.round(dotR * 1.63);
+  for (const [color, idxs] of stars) { mapCtx.beginPath(); for (const i of idxs) starSubpath(cx(i), cy(i), sr); mapCtx.fillStyle = color; mapCtx.fill(); }
+}
+function collectTileBorders(i, frame, edges, stars, edgesTop, vis) {
   const v = frame.get(i); if (v === undefined) return;
   const o = (v >> 3) & 63, c = v & 7, meta = ownerMeta(o);
   if (meta.kind === 'village') return;
   const nb = neighborsByIndex[i];
   const suz = (meta.kind === 'citystate' && c === 2 && (v >> 9)) ? (v >> 9) - 1 : -1;
   // Suzerained city-state center: fill with the suzerain's territory color (cellKeyFill) + a full ring in
-  // the suzerain's border color (outline), but keep the DOT the city-state's own type color so you can
-  // still tell which city-state it is.
+  // the suzerain's border color (outline). The center DOT (city-state's own type color) is DOM — dotMapFor.
   if (suz >= 0) {
     const col = ownerColors(suz);
     for (let d = 0; d < 6; d++) pushGroup(edges, col.secondaryCss, [i, d]);
-    pushGroup(dots, meta.dotType, i);
     return;
   }
   // City-state rings go in edgesTop (drawn AFTER major borders) so they're never overwritten where a
@@ -700,23 +1107,33 @@ function collectTileBorders(i, frame, edges, dots, stars, edgesTop) {
   let borderCol, centerDot, targetEdges;
   if (meta.kind === 'citystate') { borderCol = meta.dotType; centerDot = meta.dotType; targetEdges = edgesTop; }
   else { const col = ownerColors(o); borderCol = col.secondaryCss; centerDot = col.primaryCss; targetEdges = edges; }
-  // Draw a border on every edge whose neighbor is a DIFFERENT owner (or unowned), in THIS tile's color.
-  // (No lower-index dedup: that made the shared edge take whichever neighbor was lower-index — leaving
-  // gaps in a territory's ring where it abuts another owner, and dropping the edge entirely next to
-  // borderless villages. Each territory now gets a complete ring.)
+  // Draw a border on every edge whose neighbor is a DIFFERENT owner (or unowned), in THIS tile's color —
+  // one stroke per contested edge, owner-side deterministic: a CONQUERED urban tile (owner ≠ founder at
+  // this frame) always draws, so a captured city's whole perimeter rings in the conqueror's color; among
+  // equally-(un)conquered sides the HIGHER tile class draws (capital 4 > town 3 > center 2 > district 1 >
+  // rural 0; recorder cls codes); full peers both draw (order decides). Majors only: city-state tiles
+  // never skip (their edgesTop rings stay complete — the old gap fix). Never yield to a tile that won't
+  // draw: villages draw no borders, and fog-hidden neighbors draw nothing.
+  const selfConq = c >= 1 && meta.kind !== 'citystate' && conqueredAt(i, o);
   for (let d = 0; d < 6; d++) {
-    const ni = nb[d]; const no = (ni >= 0 && frame.has(ni)) ? ((frame.get(ni) >> 3) & 63) : -1;
+    const ni = nb[d]; if (ni >= 0 && !frame.has(ni)) { pushGroup(targetEdges, borderCol, [i, d]); continue; }
+    const nv = ni >= 0 ? frame.get(ni) : undefined;
+    const no = nv !== undefined ? ((nv >> 3) & 63) : -1;
     if (no === o) continue;   // same owner → interior edge, no border
+    if (meta.kind !== 'citystate' && nv !== undefined && (!vis || vis[ni] !== 0) && ownerMeta(no).kind !== 'village') {
+      const nConq = (nv & 7) >= 1 && conqueredAt(ni, no);
+      if (nConq && !selfConq) continue;                     // conqueror always draws this edge
+      if (nConq === selfConq && (nv & 7) > c) continue;     // tie → higher class draws
+    }
     pushGroup(targetEdges, borderCol, [i, d]);
   }
-  if (c === 4) pushGroup(stars, centerDot, i);        // major capital: star
-  else if (c === 2) pushGroup(dots, centerDot, i);    // major city: dot
+  if (c === 4) pushGroup(stars, centerDot, i);        // major capital: star (city DOTS are DOM — dotMapFor)
 }
 // --- static background layer -------------------------------------------------
-// (Re)draw the bg layer for the current fog state; clearRect first. Redrawn only on a layout or fog
-// change, so it sits outside the per-scrub redraw path. Fog OFF:
-// full terrain — the big static layer, drawn ONCE, so it leaves the per-turn path. Fog ON: a single flat
-// hidden-color fill (visible terrain is drawn per turn on the state layer, since visibility changes).
+// (Re)draw the bg terrain; clearRect first. Redrawn only on a layout or fog change (ensureBackground
+// gates on bgDirty / bgFog), so it stays out of the per-scrub path. Fog OFF: full static terrain. Fog ON:
+// a single flat hidden-color fill (visible terrain is painted per position in the state layer, since
+// visibility changes each turn).
 function renderBackground() {
   if (!bgLayer.ctx || !basePos) return;
   mapCtx = bgLayer.ctx;
@@ -732,94 +1149,305 @@ function renderBackground() {
 function ensureBackground() { if (bgDirty || bgFog !== fogMode) renderBackground(); }
 
 // --- change detection ---------------------------------------------------------
-// State-layer delta gate: on a SEQUENTIAL advance we can skip the whole state redraw when nothing that layer
-// draws changed — read straight off the save's per-turn deltas (no hashing). rec.terr/rec.won empty means no
-// territory/wonder change; rec.vis empty (fog on) means no visibility change; suzerainty/age/toggles tracked
-// separately. Skipping leaves the canvas as-is (free re-composite) and issues no draw calls.
+// State-layer delta gate: on a SEQUENTIAL advance we can skip the whole state redraw when nothing that
+// layer draws changed — read straight off the save's per-turn deltas (no hashing). Skipping leaves the
+// canvas as-is (free re-composite) and issues no paint calls.
 let lastStatePos = -2, lastStateSig = '', lastSuzeSig = '';
-function stateSignature() { return `${showTerritory?1:0}${showBorders?1:0}${showResources?1:0}${showWonders?1:0}${fogMode?1:0}|${frames[pos]?frames[pos][0]:''}`; }
+function stateSignature() { return `${showTerritory?1:0}${showBorders?1:0}${showResources?1:0}${showWonders?1:0}${fogMode?1:0}`; }
 function suzeSig(t) { const m = readSuzerainTurn(t); if (!m || !m.size) return ''; const a = []; for (const [cs, s] of m) a.push(cs + ':' + s); a.sort(); return a.join(','); }
 function stateUnchanged() {
   if (pos !== lastStatePos + 1) return false;              // only when we drew the immediately-previous turn
   const rec = readTurnCached(pos);
   if (!rec || rec.s === 1) return false;                   // snapshot / age boundary → full redraw
   if (rec.terr && rec.terr.length) return false;           // territory (fills + borders) changed
-  if (rec.won && rec.won.length) return false;             // man-made wonders changed
   if (fogMode && rec.vis && rec.vis.length) return false;  // fog visibility changed
   if (stateSignature() !== lastStateSig) return false;     // a layer toggle / fog / age changed
   if (suzeSig(pos) !== lastSuzeSig) return false;          // suzerainty changed (not delta-coded)
   return true;
 }
+let lastRecordingFp = null;
+
+// --- layer-canvas machinery ------------------------------------------------------------------------
+function curStateBoxKey() { return `${mapPxW}x${mapPxH}@${mapDpr}+${mapX},${mapY}`; }
+function layerApplyBox(slot) {
+  const cv = slot.el;
+  cv.width = Math.max(1, Math.round(mapPxW * mapDpr)); cv.height = Math.max(1, Math.round(mapPxH * mapDpr));
+  cv.style.left = mapX + 'px'; cv.style.top = mapY + 'px';
+  cv.style.width = mapPxW + 'px'; cv.style.height = mapPxH + 'px';
+  slot.ctx.setTransform(mapDpr, 0, 0, mapDpr, 0, 0);
+  slot.box = curStateBoxKey();
+}
+function makeAgedSlot(L) {
+  const cv = document.createElement('canvas');
+  cv.style.cssText = `position:fixed;pointer-events:none;z-index:${L.z};display:none;`;
+  document.body.appendChild(cv);
+  let ctx = null; try { ctx = cv.getContext('2d'); if (ctx) instrumentCtx(ctx); } catch (e) { err(`${L.id} ctx: ${e}`); }
+  return { el: cv, ctx, box: '', painted: false };
+}
+function agedSlotFor(L, key) {
+  let w = L.byAge.get(key);
+  if (!w) { w = L.spare.pop() || makeAgedSlot(L); L.byAge.set(key, w); }
+  if (w.box !== curStateBoxKey()) { layerApplyBox(w); w.painted = false; }
+  return w;
+}
+function showAgedSlot(L, w) {
+  if (L.el && L.el !== w.el) L.el.style.display = 'none';
+  L.el = w.el;
+}
+// Per-age resource canvas: painted once per age (fog OFF only — fog ON draws the vis-gated overlay in the
+// state layer; see drawStateLayer).
+function drawResAge() {
+  const w = agedSlotFor(resLayer, frames[pos][0]);
+  showAgedSlot(resLayer, w);
+  if (w.painted || !w.ctx) return;
+  HB.spaints++;   // HB: wholesale repaints
+  mapCtx = w.ctx; mapRoot = bgLayer.el;
+  mapCtx.clearRect(0, 0, mapPxW, mapPxH);
+  paintResourcesForAge(frames[pos][0]);
+  w.painted = true;
+}
+// Natural-wonder ring subpaths (CW outer + CCW inner hole) for the given tiles; one fill call.
+// Ring thickness factor 0.30 (user preference — thicker than the original 0.22).
+// NATW_DX: optical horizontal nudge (px) for natural-wonder rings. The triangle is geometrically centered
+// on the hex center, but the un-rounded center sat up to 0.5px LEFT of the (rounded) man-made wonders, and
+// an upward triangle reads a touch left-heavy; round the center to match man-made + this small right nudge.
+function natWonderRings(vis, only) {
+  const wr = Math.max(5, Math.round(hexW * 0.32)), yo = Math.round(hexH * 0.07), lw = Math.max(2, Math.round(wr * 0.30));
+  const NATW_DX = Math.round(hexW * 0.03);
+  let any = false;
+  mapCtx.beginPath();
+  for (const idx of naturalWonders) {
+    if (!basePos[idx] || (vis && vis[idx] === 0)) continue;
+    if (only && !only.has(idx)) continue;
+    any = true;
+    const cx = Math.round(basePos[idx].x + hexW / 2) + NATW_DX, cy = Math.round(basePos[idx].y + hexH / 2 + yo);
+    triSubpath(cx, cy, wr);
+    triSubpathCCW(cx, cy, wr - lw);
+  }
+  if (any) { mapCtx.fillStyle = '#101418'; mapCtx.fill(); }
+}
+// Fog OFF: the one-per-game natural-wonders canvas, painted once per layout.
+function drawNatw() {
+  const w = agedSlotFor(natwLayer, 0);
+  showAgedSlot(natwLayer, w);
+  if (w.painted || !w.ctx) return;
+  HB.spaints++;   // HB: wholesale repaints
+  mapCtx = w.ctx; mapRoot = bgLayer.el;
+  mapCtx.clearRect(0, 0, mapPxW, mapPxH);
+  natWonderRings(null);
+  w.painted = true;
+}
+function syncLayerDisplays() {
+  if (resLayer.el) resLayer.el.style.display = (mapVisible && showResources && !fogMode) ? 'block' : 'none';
+  if (natwLayer.el) natwLayer.el.style.display = (mapVisible && showWonders && !fogMode) ? 'block' : 'none';
+  if (wonDom.el) wonDom.el.style.display = (mapVisible && showWonders) ? 'block' : 'none';   // display cycles measured free
+}
+function recycleAllLayers() {   // layout changed / recording changed → per-age/static canvases stale
+  for (const L of [resLayer, natwLayer]) {
+    for (const [, w] of L.byAge) { w.el.style.display = 'none'; w.box = ''; w.painted = false; L.spare.push(w); }
+    L.byAge.clear(); L.el = null;
+  }
+}
 // Redraw the per-turn layers (state then units) over the static background. Background is (re)painted only
 // when layout or fog changes, via ensureBackground.
 function drawMap(frame) {
-  if (!bgLayer.ctx || !stateLayer.ctx || !unitLayer.ctx || !basePos || !frame) return;
+  if (!bgLayer.ctx || !stateLayer.ctx || !unitDom.el || !basePos || !frame) return;
+  HB.draws++;   // HB counter
   ensureBackground();
   const vis = fogMode ? visForPos() : null;
   drawStateLayer(frame, vis);
+  if (showResources && !fogMode && frames.length) drawResAge();
+  if (showWonders && !fogMode) drawNatw();
+  syncLayerDisplays();
+  if (showWonders) drawWonderLayer(frame, vis);
+  drawDotLayer(frame, vis);
   drawUnitLayer(frame, vis);
   curFrame = frame;
 }
-// State layer: territory fills + fog dim + borders + resources + wonders. Fills — fog ON: draw every VISIBLE
-// tile (bg is flat black, so terrain must be painted here); fog OFF: draw only NON-terrain (owned) tiles —
-// plain terrain already lives on the static bg layer, which is the whole point of the split.
-function drawStateLayer(frame, vis) {
-  if (stateUnchanged()) { lastStatePos = pos; return; }   // unchanged since last turn → leave the canvas untouched
-  beginLayer(stateLayer);
-  const cx = i => basePos[i].x + hexW / 2, cy = i => basePos[i].y + hexH / 2;
-  const fills = new Map();
-  for (let i = 0; i < basePos.length; i++) {
-    if (vis) { if (vis[i] === 0) continue; }
-    else if (terrain && terrain[i] === 0) continue;
-    const kf = cellKeyFill(i, frame);
-    if (!vis && kf.key === 'T') continue;   // fog off: unowned/plain-terrain tile is already on the bg layer
-    pushGroup(fills, kf.fill, i);
+// --- partial state repaint ------------------------------------------------------------------------------
+// Color-batched local repaint (user-designed): between the last-drawn position and the target, collect the
+// CHANGED tiles from the recorded deltas, clear just those (pad by the border width — strokes straddle
+// edges), and repaint only the local subset of each affected color group. Calls ∝ colors touched (~10-20)
+// instead of a wholesale ~40-50. Bails to wholesale across snapshots (age identity/color swaps), on big
+// change-sets, or when toggles/fog changed since the last draw.
+function withNeighbors(S) { const D = new Set(S); for (const i of S) { const nb = neighborsByIndex[i]; if (nb) for (const ni of nb) if (ni >= 0) D.add(ni); } return D; }
+// Fog dim is PRE-BLENDED into fill colors (memoized) instead of an alpha overlay: alpha hexes can't be
+// seam-stroked (double-darkening), which left thin bright AA lines between dimmed tiles. Blended fills are
+// ordinary opaque colors and get the standard fill+stroke seam treatment.
+const dimCssCache = new Map();
+function cssToRgb(c) {
+  if (c.charCodeAt(0) === 35) return hexToRgb(c);
+  const m = /rgba?\(([^)]+)\)/.exec(c);
+  if (!m) return [128, 128, 128];
+  const q = m[1].split(',');
+  return [+q[0], +q[1], +q[2]];
+}
+function dimCss(c) { let d = dimCssCache.get(c); if (!d) { d = blendCss(cssToRgb(c), [4, 6, 10], 0.55); dimCssCache.set(c, d); } return d; }
+// Tiered fill collection: city-center fills ('C'/'Z' keys) paint AFTER everything else so centers always
+// own their shared edges — otherwise neighboring rural seam strokes encroach ~1px and centers look
+// smaller with off-center stars/dots (user-observed).
+function stateFillPush(i, frame, vis, base, top) {
+  if (!basePos[i]) return;
+  if (vis) { if (vis[i] === 0) return; }
+  else if (terrain && terrain[i] === 0) return;
+  const kf = cellKeyFill(i, frame);
+  if (!vis && kf.key === 'T') return;   // fog off: unowned/plain-terrain tile is already on the bg layer
+  const color = (vis && vis[i] === 1) ? dimCss(kf.fill) : kf.fill;
+  const k0 = kf.key.charCodeAt(0);
+  pushGroup((k0 === 67 || k0 === 90) ? top : base, color, i);   // 'C'/'Z' = centers → top tier
+}
+function paintFillTiers(base, top) {
+  for (const groups of [base, top]) {
+    for (const color of [...groups.keys()].sort()) { const idxs = groups.get(color); mapCtx.beginPath(); for (const i of idxs) hexSubpath(i); mapCtx.fillStyle = color; mapCtx.fill(); mapCtx.lineWidth = 1; mapCtx.strokeStyle = color; mapCtx.stroke(); }
   }
-  // fill + a 1px same-color stroke closes seams on ALL hex edges. Stable sorted order keeps overlaps from flickering.
-  for (const color of [...fills.keys()].sort()) { const idxs = fills.get(color); mapCtx.beginPath(); for (const i of idxs) hexSubpath(i); mapCtx.fillStyle = color; mapCtx.fill(); mapCtx.lineWidth = 1; mapCtx.strokeStyle = color; mapCtx.stroke(); }
-  // fog dim: darken revealed (known-but-unseen) tiles' terrain — before borders/markers so those stay full brightness.
+}
+// What the canvas currently shows — retained so a partial can DIFF directly against the target frame.
+// This works ACROSS AGES too (user insight: territory/border colors follow LEADERS, which persist across
+// ages even though civs swap) — guarded by comparing the recorded identity colors between the two
+// positions, so the rare genuine color change still falls back to wholesale.
+let lastStateFrame = null, lastStateVis = null, lastStateIdent = null;
+function noteStateDrawn(frame, vis) { lastStateFrame = frame; lastStateVis = vis; lastStateIdent = identityForPos(); }
+function identColorsEqual(a, b) {
+  if (!a || !b) return false;
+  if (a === b) return true;
+  if (a.size !== b.size) return false;
+  for (const [k, ea] of a) { const eb = b.get(k); if (!eb || ea[3] !== eb[3] || ea[4] !== eb[4]) return false; }
+  return true;
+}
+function tryPartialState(frame, vis) {
+  if (!lastStateFrame || lastStatePos < 0 || lastStatePos === pos) return false;
+  if (stateSignature() !== lastStateSig) return false;                        // toggles/fog changed → wholesale
+  if (!identColorsEqual(lastStateIdent, identityForPos())) return false;      // an owner's colors changed → wholesale
+  const maxT = Math.max(60, basePos.length >> 3);
+  const T = new Set();
+  for (const [i, v] of frame) { if (lastStateFrame.get(i) !== v) { T.add(i); if (T.size > maxT) return false; } }   // changed/added (suze bits included via frameFor)
+  for (const i of lastStateFrame.keys()) { if (!frame.has(i)) { T.add(i); if (T.size > maxT) return false; } }      // removed (tile became unowned)
   if (vis) {
-    const revealedIdx = [];
-    for (let i = 0; i < basePos.length; i++) if (vis[i] === 1) revealedIdx.push(i);
-    if (revealedIdx.length) { mapCtx.beginPath(); for (const i of revealedIdx) hexSubpath(i); mapCtx.fillStyle = FOG_REVEALED; mapCtx.fill(); }
+    const lv = lastStateVis;
+    if (!lv || lv.length !== vis.length) return false;
+    for (let i = 0; i < vis.length; i++) { if (vis[i] !== lv[i]) { T.add(i); if (T.size > maxT) return false; } }
   }
-  // borders + center markers
+  if (T.size === 0) return true;        // jump across turns where nothing this layer draws changed
+  mapCtx = stateLayer.ctx; mapRoot = bgLayer.el;
+  HB.walks++;   // HB: partial repaints
+  const pad = borderT + 1;
+  for (const i of T) { const p = basePos[i]; if (p) mapCtx.clearRect(p.x - pad, p.y - pad, hexW + 2 * pad, hexH + 2 * pad); }
+  const R = withNeighbors(T);           // repaint set: changed tiles + fringe-damaged neighbors
+  const fillsBase = new Map(), fillsTop = new Map();
+  for (const i of R) stateFillPush(i, frame, vis, fillsBase, fillsTop);
+  // CENTER tiles just OUTSIDE the repaint set: repaint them too (top tier) so R's seam strokes can't
+  // encroach their edges — keeps center hexes full-size at partial boundaries. Centers only: repainting
+  // ring-2 rural would merely push the same edge-flip one ring further out.
+  for (const i of withNeighbors(R)) {
+    if (R.has(i)) continue;
+    const v = frame.get(i);
+    if (v !== undefined && (v & 7) >= 2) stateFillPush(i, frame, vis, fillsTop, fillsTop);
+  }
+  paintFillTiers(fillsBase, fillsTop);
+  // borders: rings change for tiles whose own/neighbor owner changed, and R's seam strokes clipped the
+  // inner stroke halves of the NEXT ring out — redraw complete rings for R ∪ N(R) (idempotent overdraw).
   if (showBorders) {
-    const edges = new Map(), dots = new Map(), stars = new Map(), edgesTop = new Map();
-    for (const [i] of frame) { if (vis && vis[i] === 0) continue; collectTileBorders(i, frame, edges, dots, stars, edgesTop); }
-    mapCtx.lineCap = 'round';
-    for (const [color, segs] of edges) { mapCtx.beginPath(); for (const [i, d] of segs) edgeSubpath(i, d); mapCtx.strokeStyle = color; mapCtx.lineWidth = borderT; mapCtx.stroke(); }
-    for (const [color, segs] of edgesTop) { mapCtx.beginPath(); for (const [i, d] of segs) edgeSubpath(i, d); mapCtx.strokeStyle = color; mapCtx.lineWidth = borderT; mapCtx.stroke(); }   // city-state rings on top
-    for (const [color, idxs] of dots) { mapCtx.beginPath(); for (const i of idxs) circleSubpath(cx(i), cy(i), dotR); mapCtx.fillStyle = color; mapCtx.fill(); }
-    const sr = Math.round(dotR * 1.63);
-    for (const [color, idxs] of stars) { mapCtx.beginPath(); for (const i of idxs) starSubpath(cx(i), cy(i), sr); mapCtx.fillStyle = color; mapCtx.fill(); }
+    const cx = i => basePos[i].x + hexW / 2, cy = i => basePos[i].y + hexH / 2;
+    const edges = new Map(), stars = new Map(), edgesTop = new Map();
+    for (const i of withNeighbors(R)) { if (vis && vis[i] === 0) continue; collectTileBorders(i, frame, edges, stars, edgesTop, vis); }
+    strokeBorderTiers(edges, edgesTop, stars, cx, cy);
   }
-  // resource overlay: a thin hollow hex, inset, tinted by class. Per-age, fog-respecting.
-  if (showResources && frames.length) {
+  // fog-only extras on the repainted tiles: resource hexes + natural-wonder rings live in this layer
+  // when fog is on (fog off keeps them on their own canvases, untouched by these clears).
+  if (showResources && vis && frames.length) {
     const res = resourcesForPos(), byColor = new Map();
-    for (const [i, code] of res) { if (!basePos[i] || (vis && vis[i] === 0)) continue; pushGroup(byColor, RESOURCE_COLOR[code] || '#dddddd', i); }
+    for (const i of R) { if (vis[i] === 0) continue; const code = res.get(i); if (code != null) pushGroup(byColor, RESOURCE_COLOR[code] || '#dddddd', i); }
     if (byColor.size) {
       mapCtx.lineJoin = 'round';
       const rw = Math.max(1, Math.round(hexW * 0.06));
       for (const [color, idxs] of byColor) { mapCtx.beginPath(); for (const i of idxs) insetHexSubpath(i, 0.85); mapCtx.strokeStyle = color; mapCtx.lineWidth = rw; mapCtx.stroke(); }
     }
   }
-  // wonders: man-made solid triangle (secondary); natural = dark triangle + inner tile-color triangle
-  if (showWonders) {
-    const wr = Math.max(5, Math.round(hexW * 0.32)), yo = Math.round(hexH * 0.07), lw = Math.max(1, Math.round(wr * 0.22));
-    const mm = new Map();
-    if (frames.length) for (const [idx, e] of wondersForPos()) { const owner = e[0]; if (basePos[idx] && !(vis && vis[idx] === 0)) pushGroup(mm, ownerColors(owner).secondaryCss, idx); }
-    for (const [color, idxs] of mm) { mapCtx.beginPath(); for (const i of idxs) triSubpath(cx(i), cy(i) + yo, wr); mapCtx.fillStyle = color; mapCtx.fill(); }
-    const inner = new Map(); let anyNat = false;
-    mapCtx.beginPath();
-    for (const idx of naturalWonders) { if (!basePos[idx] || (vis && vis[idx] === 0)) continue; anyNat = true; triSubpath(cx(idx), cy(idx) + yo, wr); pushGroup(inner, cellKeyFill(idx, frame).fill, idx); }
-    if (anyNat) { mapCtx.fillStyle = '#101418'; mapCtx.fill(); }
-    for (const [color, idxs] of inner) { mapCtx.beginPath(); for (const i of idxs) triSubpath(cx(i), cy(i) + yo, wr - lw); mapCtx.fillStyle = color; mapCtx.fill(); }
+  if (showWonders && vis) natWonderRings(vis, R);
+  return true;
+}
+// State layer: territory fills + fog dim + borders(+capital stars) — and, under fog only, the vis-gated
+// resource overlay. Fills — fog ON: draw every VISIBLE tile (bg is flat black, so terrain must be painted
+// here); fog OFF: draw only NON-terrain (owned) tiles — plain terrain already lives on the static bg
+// layer. City dots, wonders and units are DOM layers above. Seams close with exact hexes + a same-color
+// 1px stroke — never overlap subpaths in one path (Cohtml fills are EVEN-ODD; overlap punches holes).
+function drawStateLayer(frame, vis) {
+  if (stateUnchanged()) { lastStatePos = pos; noteStateDrawn(frame, vis); return; }   // unchanged since last turn → leave the canvas untouched
+  if (tryPartialState(frame, vis)) { lastStatePos = pos; lastStateSig = stateSignature(); lastSuzeSig = suzeSig(pos); noteStateDrawn(frame, vis); return; }
+  mapCtx = stateLayer.ctx; mapRoot = bgLayer.el;
+  mapCtx.clearRect(0, 0, mapPxW, mapPxH);
+  HB.spaints++;   // HB: wholesale repaints
+  const cx = i => basePos[i].x + hexW / 2, cy = i => basePos[i].y + hexH / 2;
+  // Tiered, dim-preblended fills (see stateFillPush): base tier then city centers, each fill + 1px
+  // same-color seam stroke; fog dim is baked into the colors, so dimmed tiles seam like any others.
+  const fillsBase = new Map(), fillsTop = new Map();
+  for (let i = 0; i < basePos.length; i++) stateFillPush(i, frame, vis, fillsBase, fillsTop);
+  paintFillTiers(fillsBase, fillsTop);
+  // borders + capital stars (city dots are DOM)
+  if (showBorders) {
+    const edges = new Map(), stars = new Map(), edgesTop = new Map();
+    for (const [i] of frame) { if (vis && vis[i] === 0) continue; collectTileBorders(i, frame, edges, stars, edgesTop, vis); }
+    strokeBorderTiers(edges, edgesTop, stars, cx, cy);
   }
+  // resource overlay under FOG only (vis-gated; fog off uses the per-age resource canvases instead)
+  if (showResources && vis && frames.length) {
+    const res = resourcesForPos(), byColor = new Map();
+    for (const [i, code] of res) { if (!basePos[i] || vis[i] === 0) continue; pushGroup(byColor, RESOURCE_COLOR[code] || '#dddddd', i); }
+    if (byColor.size) {
+      mapCtx.lineJoin = 'round';
+      const rw = Math.max(1, Math.round(hexW * 0.06));
+      for (const [color, idxs] of byColor) { mapCtx.beginPath(); for (const i of idxs) insetHexSubpath(i, 0.85); mapCtx.strokeStyle = color; mapCtx.lineWidth = rw; mapCtx.stroke(); }
+    }
+  }
+  // natural-wonder rings under FOG only (vis-gated; the hole shows the state fill painted above)
+  if (showWonders && vis) natWonderRings(vis);
   lastStatePos = pos; lastStateSig = stateSignature(); lastSuzeSig = suzeSig(pos);
+  noteStateDrawn(frame, vis);
+}
+// Resource overlay: a thin hollow hex, inset, tinted by class. Constant within an age → one canvas per age.
+function paintResourcesForAge(ageId) {
+  const res = readResourcesForAge(ageId), byColor = new Map();
+  for (const [i, code] of res) { if (!basePos[i]) continue; pushGroup(byColor, RESOURCE_COLOR[code] || '#dddddd', i); }
+  if (!byColor.size) return;
+  mapCtx.lineJoin = 'round';
+  const rw = Math.max(1, Math.round(hexW * 0.06));
+  for (const [color, idxs] of byColor) { mapCtx.beginPath(); for (const i of idxs) insetHexSubpath(i, 0.85); mapCtx.strokeStyle = color; mapCtx.lineWidth = rw; mapCtx.stroke(); }
+}
+// Man-made wonders: DOM triangle markers (CSS border trick — zero-size div, transparent side borders,
+// colored bottom border forms an upward triangle). The container sits UNDER the fog-mask canvas, so
+// hidden/dimmed states come free. Same pooled-slot pattern as units/dots; recolors (conquest) are rare.
+const wonSlots = [];
+function resetWonDom() { for (const m of wonSlots) { m.geom = ''; m.x = -1; m.y = -1; m.col = ''; } }
+function wonSlotAt(n) {
+  let m = wonSlots[n];
+  if (!m) {
+    const el = document.createElement('div');
+    el.style.cssText = 'position:absolute;pointer-events:none;width:0;height:0;border-style:solid;border-top-width:0;border-left-color:transparent;border-right-color:transparent;';
+    wonDom.el.appendChild(el);
+    m = { el, op: 1, geom: '', x: -1, y: -1, col: '' };
+    wonSlots[n] = m;
+  }
+  return m;
+}
+function placeWon(m, geom, wr, h, x, y, col) {
+  if (m.geom !== geom) { m.geom = geom; m.el.style.borderLeftWidth = m.el.style.borderRightWidth = wr + 'px'; m.el.style.borderBottomWidth = h + 'px'; }
+  if (m.x !== x) { m.el.style.left = x + 'px'; m.x = x; HB.moves++; }
+  if (m.y !== y) { m.el.style.top = y + 'px'; m.y = y; HB.moves++; }
+  if (m.col !== col) { m.el.style.borderBottomColor = col; m.col = col; HB.marks++; }
+  if (!m.op) { m.el.style.opacity = '1'; m.op = 1; HB.mhides++; }
+}
+function drawWonderLayer(frame, vis) {
+  if (!wonDom.el || !frames.length) return;
+  const wr = Math.max(5, Math.round(hexW * 0.32)), yo = Math.round(hexH * 0.07), h = Math.round(2 * wr * TRI_RATIO), geom = 'w' + wr;
+  let n = 0;
+  for (const [idx, e] of wondersForPos()) {
+    if (!basePos[idx] || (vis && vis[idx] === 0)) continue;
+    const x = Math.round(basePos[idx].x + hexW / 2 - wr), y = Math.round(basePos[idx].y + hexH / 2 + yo - 2 * h / 3);
+    placeWon(wonSlotAt(n++), geom, wr, h, x, y, ownerColors(e[0]).secondaryCss);
+  }
+  for (let s = n; s < wonSlots.length; s++) { const m = wonSlots[s]; if (m && m.op) { m.el.style.opacity = '0'; m.op = 0; } }   // spares: opacity-park
 }
 // Build this turn's visible unit set → Map(tile -> "ringColor|coreColor").
-let lastUnitPos = -2, lastUnitMap = new Map();
 function unitMapFor(p, vis) {
   const m = new Map();
   if (!(showUnits && frames.length)) return m;
@@ -827,50 +1455,127 @@ function unitMapFor(p, vis) {
   for (const [idx, owner] of readUnitsTurn(p)) { if (seen.has(idx)) continue; if (vis && (vis[idx] || 0) !== 2) continue; seen.add(idx); m.set(idx, playerBorderColor(owner) + '|' + unitColor(owner)); }
   return m;
 }
-// Units layer (top): drawn as squares (ring + core). Because units sit alone on this canvas, we update it
-// INCREMENTALLY on a sequential advance — clearRect only the tiles units left, redraw only the tiles that
-// changed — instead of clearing and repainting the whole (late-game huge) carpet every turn. Falls back to a
-// full repaint on any non-sequential jump (scrub) or a toggle/fog change. The full-repaint path batches its
-// fills by color as the scrub-crash mitigation (see the KNOWN ISSUE note at the canvas-draw section); the
-// incremental path still draws changed units one-shot — a handful per turn, negligible leak.
-function drawUnitLayer(frame, vis) {
-  const r = Math.max(3, Math.round(hexW * 0.19)), bw = Math.max(2, Math.round(hexW * 0.07)), pad = r + 1;
-  const cx = i => basePos[i].x + hexW / 2, cy = i => basePos[i].y + hexH / 2;
-  const drawOne = (i, cols) => { const k = cols.indexOf('|'); mapCtx.beginPath(); squareSubpath(cx(i), cy(i), r); mapCtx.fillStyle = cols.slice(0, k); mapCtx.fill(); mapCtx.beginPath(); squareSubpath(cx(i), cy(i), Math.max(1, r - bw)); mapCtx.fillStyle = cols.slice(k + 1); mapCtx.fill(); };
-  const newMap = unitMapFor(pos, vis);
-  const sequential = (pos === lastUnitPos + 1);
-  const full = !sequential || !showUnits;
-  if (full) {
-    beginLayer(unitLayer);   // clearRect the whole layer, then repaint every unit
-    // BATCH by color — one beginPath/fill per color group (rings first, then cores on top; markers never
-    // overlap, one per tile) instead of 2 one-shot fills per unit. This is the scrub-crash mitigation:
-    // one-shot unit fills leak ~0.3 static-resource pool items each, batched fills far less — measured
-    // fuse went from ~970 to ~3,500 hard-scrub redraws per session. See the KNOWN ISSUE note above.
-    const rings = new Map(), cores = new Map();
-    for (const [i, cols] of newMap) { const k = cols.indexOf('|'); pushGroup(rings, cols.slice(0, k), i); pushGroup(cores, cols.slice(k + 1), i); }
-    for (const [color, idxs] of rings) { mapCtx.beginPath(); for (const i of idxs) squareSubpath(cx(i), cy(i), r); mapCtx.fillStyle = color; mapCtx.fill(); }
-    const cr = Math.max(1, r - bw);
-    for (const [color, idxs] of cores) { mapCtx.beginPath(); for (const i of idxs) squareSubpath(cx(i), cy(i), cr); mapCtx.fillStyle = color; mapCtx.fill(); }
-  } else {
-    mapCtx = unitLayer.ctx; mapRoot = bgLayer.el;   // patch the retained canvas in place (no full clear)
-    for (const [i, oc] of lastUnitMap) { if (newMap.get(i) !== oc) mapCtx.clearRect(cx(i) - pad, cy(i) - pad, 2 * pad, 2 * pad); }   // departed / changed → clear
-    for (const [i, nc] of newMap) { if (lastUnitMap.get(i) !== nc) drawOne(i, nc); }                                                 // arrived / changed → draw
+// Units layer (top): DOM marker divs in unitDom. A marker is TWO nested divs with plain background-color
+// — outer = ring color, inner (inset by bw) = core color. NO border property and NO cssText rewrites
+// (borders are generated images; wholesale style rewrites re-register them), and divs are never removed
+// or recreated (DOM recreation re-registers static resources — the old leader-ribbon leak). Markers are a
+// dense SLOT array: the i-th visible unit uses slot i, so a scrub tick mostly moves divs (left/top) and
+// recolors them; per-slot caches skip writes for unchanged properties. Spare slots simply park at
+// opacity:0 — hide/show cycling measured FREE at 150k styled-element cycles + 150k canvas cycles
+// (harness disp/dispS/cvShow, 2026-07-10), which retired the earlier stacking-park workaround.
+const unitSlots = [];      // [{ el, inner, op, geom, x, y, cols }] — cache mirrors the div's inline styles
+function parkSlot(m) { if (m.op) { m.el.style.opacity = '0'; m.op = 0; } }
+function resetUnitDom() {  // layout changed → drop the per-slot caches; the next draw re-places every marker
+  for (const m of unitSlots) { m.geom = ''; m.x = -1; m.y = -1; m.cols = ''; }
+}
+function unitSlot(n) {
+  let m = unitSlots[n];
+  if (!m) {
+    // Born painted: colors/position are written by the caller in the same pass. The first paint is this
+    // element's one static registration (bounded by the peak simultaneous unit count).
+    const el = document.createElement('div'), inner = document.createElement('div');
+    el.style.cssText = 'position:absolute;pointer-events:none;';
+    inner.style.cssText = 'position:absolute;';
+    el.appendChild(inner); unitDom.el.appendChild(el);
+    m = { el, inner, op: 1, geom: '', x: -1, y: -1, cols: '' };
+    unitSlots[n] = m;
   }
-  lastUnitMap = newMap; lastUnitPos = pos;
+  return m;
+}
+function placeSlot(m, geom, r, bw, x, y, cols) {
+  if (m.geom !== geom) {   // size the square once per layout (outer 2r box; inner inset bw on each side)
+    m.geom = geom;
+    m.el.style.width = m.el.style.height = (2 * r) + 'px';
+    m.inner.style.left = m.inner.style.top = bw + 'px';
+    m.inner.style.width = m.inner.style.height = Math.max(1, 2 * (r - bw)) + 'px';
+  }
+  if (m.x !== x) { m.el.style.left = x + 'px'; m.x = x; HB.moves++; }
+  if (m.y !== y) { m.el.style.top = y + 'px'; m.y = y; HB.moves++; }
+  if (m.cols !== cols) {
+    const k = cols.indexOf('|');
+    m.el.style.backgroundColor = cols.slice(0, k);
+    m.inner.style.backgroundColor = cols.slice(k + 1);
+    m.cols = cols;
+    HB.marks++;
+  }
+  if (!m.op) { m.el.style.opacity = '1'; m.op = 1; HB.mhides++; }   // unpark after an n=0 fallback (counted: leak-relevant)
+}
+function drawUnitLayer(frame, vis) {
+  if (!unitDom.el) return;
+  const r = Math.max(3, Math.round(hexW * 0.19)), bw = Math.max(2, Math.round(hexW * 0.07)), geom = r + '|' + bw;
+  const newMap = unitMapFor(pos, vis);
+  let n = 0;
+  for (const [i, cols] of newMap) {
+    const x = Math.round(basePos[i].x + hexW / 2 - r), y = Math.round(basePos[i].y + hexH / 2 - r);
+    placeSlot(unitSlot(n++), geom, r, bw, x, y, cols);
+  }
+  for (let s = n; s < unitSlots.length; s++) if (unitSlots[s]) parkSlot(unitSlots[s]);   // spares: opacity-park (cycles measured free)
+}
+// --- city-dot layer (DOM, follows the Borders toggle) --------------------------------------------------
+// City-center dots as pooled border-radius divs — the same certified-free slot pattern as the unit
+// markers (position/color mutation; spares opacity-parked). Moving dots off the canvas means foundings/
+// promotions never invalidate a cached borders canvas.
+const dotSlots = [];
+function resetDotDom() { for (const m of dotSlots) { m.geom = ''; m.x = -1; m.y = -1; m.col = ''; } }
+function dotSlotAt(n) {
+  let m = dotSlots[n];
+  if (!m) {
+    const el = document.createElement('div');
+    el.style.cssText = 'position:absolute;pointer-events:none;border-radius:50%;';
+    dotDom.el.appendChild(el);
+    m = { el, op: 1, geom: '', x: -1, y: -1, col: '' };
+    dotSlots[n] = m;
+  }
+  return m;
+}
+// Tile -> dot color for the current frame: c===2 centers only (c===4 capitals get canvas stars); villages
+// none; city-states (incl. suzerained) keep their type color; majors use their primary.
+function dotMapFor(frame, vis) {
+  const m = new Map();
+  if (!(showBorders && frames.length)) return m;
+  for (const [i, v] of frame) {
+    if (!basePos[i]) continue;
+    if (vis && vis[i] === 0) continue;
+    if ((v & 7) !== 2) continue;
+    const o = (v >> 3) & 63, meta = ownerMeta(o);
+    if (meta.kind === 'village') continue;
+    m.set(i, meta.kind === 'citystate' ? meta.dotType : ownerColors(o).primaryCss);
+  }
+  return m;
+}
+function placeDot(m, geom, r, x, y, col) {
+  if (m.geom !== geom) { m.geom = geom; m.el.style.width = m.el.style.height = (2 * r) + 'px'; }
+  if (m.x !== x) { m.el.style.left = x + 'px'; m.x = x; HB.moves++; }
+  if (m.y !== y) { m.el.style.top = y + 'px'; m.y = y; HB.moves++; }
+  if (m.col !== col) { m.el.style.backgroundColor = col; m.col = col; HB.marks++; }
+  if (!m.op) { m.el.style.opacity = '1'; m.op = 1; HB.mhides++; }
+}
+function drawDotLayer(frame, vis) {
+  if (!dotDom.el) return;
+  const r = dotR, geom = 'd' + r;
+  const newMap = dotMapFor(frame, vis);
+  let n = 0;
+  for (const [i, col] of newMap) {
+    const x = Math.round(basePos[i].x + hexW / 2 - r), y = Math.round(basePos[i].y + hexH / 2 - r);
+    placeDot(dotSlotAt(n++), geom, r, x, y, col);
+  }
+  for (let s = n; s < dotSlots.length; s++) { const m = dotSlots[s]; if (m && m.op) { m.el.style.opacity = '0'; m.op = 0; } }   // spares: opacity-park
 }
 function redraw() { if (curFrame) drawMap(curFrame); }
 function terrainRgbArr(i) { return TERRAIN_RGB[(terrain && terrain[i] != null) ? terrain[i] : 8] || TERRAIN_RGB[8]; }
 function terrainCss(i) { return rgbCss(terrainRgbArr(i)); }
 function isWaterTile(i) { const t = terrain ? terrain[i] : 8; return t === 0 || t === 1 || t === 9 || t === 10; }   // deep ocean / coast / lake / navigable river
 
-// Reset render state on a geometry change. No divs to remove now — the canvas is redrawn wholesale.
+// Reset render state on a geometry change. The canvases are redrawn wholesale; the unit-marker divs are
+// hidden into their pool (never removed) and re-placed on the next draw.
 // cellByIndex is repurposed as a truthy "layout ready" sentinel (kept so existing checks still work).
 function allocCells() {
   cellByIndex = basePos; curFrame = null; prebuilt = false; building = false; buildToken++;
   markBgDirty();                                                        // new geometry → repaint the static bg
   for (const L of LAYERS) if (L.ctx) L.ctx.clearRect(0, 0, mapPxW, mapPxH);
-  lastStatePos = -2; lastStateSig = ''; lastSuzeSig = '';              // force a full state + unit repaint on the new layout
-  lastUnitPos = -2; lastUnitMap = new Map();
+  lastStatePos = -2; lastStateSig = ''; lastSuzeSig = ''; lastStateFrame = null;   // force a full state repaint on the new layout
+  recycleAllLayers();                                                  // new geometry → per-age canvases stale
+  resetUnitDom(); resetDotDom(); resetWonDom();
   ribbonRows.clear(); ribbonSigLast = null;                           // drop reused ribbon rows so they rebuild at the new scale
   if (els.ribbon) els.ribbon.innerHTML = '';
   log(`allocCells: ${basePos ? basePos.length : 0} tiles (canvas)`);
@@ -906,7 +1611,7 @@ function buildChunked(frame) {
   const finish = () => {
     if (myToken !== buildToken) return;            // superseded by a newer build / layout change
     drawMap(frame);
-    building = false; prebuilt = true; builtFrameCount = frames.length;   // remember how many frames this build covers
+    building = false; prebuilt = true; builtFrameCount = recordedFrameCount();   // remember which recording state this build covers
     if (revealWhenBuilt) { revealWhenBuilt = false; reveal(); hideLoading(); }
   };
   if (typeof requestAnimationFrame === 'function') requestAnimationFrame(finish); else finish();
@@ -915,7 +1620,7 @@ function renderFrame(frame) { drawMap(frame); }
 function repaintCells() { redraw(); }         // Territory toggle → one canvas redraw
 function rebuildAllOverlays() { redraw(); }   // Borders toggle → one canvas redraw
 
-// --- units layer (toggleable) — drawn on the canvas by drawUnitC; colors below ------------------------
+// --- units layer (toggleable) — DOM marker divs, placed by drawUnitLayer; colors below ----------------
 let showUnits = true;
 function unitColor(owner) {
   const meta = ownerMeta(owner);
@@ -931,7 +1636,7 @@ function playerBorderColor(owner) {
   if (meta.kind === 'village') return '#5a1010';
   return ownerColors(owner).secondaryCss;
 }
-function renderUnits() { redraw(); }   // toggling Units → one canvas redraw (drawUnitC does the drawing)
+function renderUnits() { redraw(); }   // toggling Units → one redraw (drawUnitLayer diffs the marker divs)
 
 // --- wonders layer (toggleable) — drawn on the canvas in drawMap (man-made = solid triangle in the
 // owner's secondary color; natural = dark triangle + inner tile-color triangle → a hollow ring). --------
@@ -946,16 +1651,25 @@ function renderWonders() { redraw(); }
 let manifest = null, frames = [], pos = 0, playing = false, timer = null;
 let lastOpenTurn = -1;   // the game turn the map was last auto-positioned for (see applyOpenPosition)
 let prebuilt = false;   // map already built (possibly hidden) and valid for the current layout
-let builtFrameCount = -1; // how many recorded frames the built/prebuilt map represents — so we can detect new frames
-// Cheap peek at the number of recorded frames straight from the manifest (no state mutation), used to
-// decide whether a prebuilt map is stale (new frames recorded since it was built).
+let builtFrameCount = ''; // count + manifest rev the built/prebuilt map represents — so we can detect BOTH new frames and same-turn re-records (mid-turn record-on-open)
+// Cheap peek straight from the manifest (no state mutation), used to decide whether a prebuilt map is stale.
 function recordedFrameCount() {
-  try { const m = readManifest(); return (m && Array.isArray(m.frames)) ? m.frames.length : 0; } catch (e) { return 0; }
+  try { const m = readManifest(); return ((m && Array.isArray(m.frames)) ? m.frames.length : 0) + '@' + ((m && m.rev != null) ? m.rev : 0); } catch (e) { return '0@0'; }
 }
 function refresh() {
   manifest = readManifest();
-  turnCache.clear(); unitsCache.clear(); suzeCache.clear(); playersCache.clear(); ownerColorCache.clear(); resCache.clear(); curBuildingsPos = -2; curSettlementsPos = -2; curVisPos = -2; curIdentityPos = -2; curRelPos = -2; curWondersPos = -2; ribbonSigLast = null;   // records re-read fresh (cheap; cleared for new-game safety)
-  frames = (manifest && Array.isArray(manifest.frames)) ? manifest.frames : [];   // already in chronological (gi) order
+  // Cross-open retention: only reset the derived state (record caches, per-age canvases, state gate,
+  // conquest table) when the RECORDING actually changed — new game, new age, or new turns recorded. Same
+  // fingerprint → reopening the map reuses every cached canvas.
+  const framesNow = (manifest && Array.isArray(manifest.frames)) ? manifest.frames : [];
+  const fp = `${manifest && manifest.rev != null ? manifest.rev : 0}|${framesNow.length}|${manifest ? manifest.w + 'x' + manifest.h : ''}|${framesNow.length ? framesNow[0][0] + ':' + framesNow[0][1] + '>' + framesNow[framesNow.length - 1][0] + ':' + framesNow[framesNow.length - 1][1] : ''}`;
+  const recordingChanged = fp !== lastRecordingFp;
+  lastRecordingFp = fp;
+  if (recordingChanged) {
+    turnCache.clear(); unitsCache.clear(); suzeCache.clear(); playersCache.clear(); ownerColorCache.clear(); resCache.clear(); curBuildingsPos = -2; curSettlementsPos = -2; curVisPos = -2; curIdentityPos = -2; curRelPos = -2; curWondersPos = -2; ribbonSigLast = null;   // records re-read fresh (cheap; cleared for new-game safety)
+    recycleAllLayers(); lastStatePos = -2; lastStateSig = ''; lastSuzeSig = ''; lastStateFrame = null; conquestEpisodes = null;   // per-age canvases + state gate + conquest table hold frame-derived content → same new-game safety
+  }
+  frames = framesNow;   // already in chronological (gi) order
   if (pos >= frames.length) pos = Math.max(0, frames.length - 1);
   if (manifest) {
     // Re-layout when the map dims OR the available area change (e.g. in-game launcher vs Victories tab,
@@ -1012,10 +1726,9 @@ function nowMs() { return (typeof performance !== 'undefined' && performance.now
 // rAF-paced COALESCING for drag scrubbing: always render the LATEST cursor position on the next animation
 // frame, and only arm the next render once the current one has run — so the rate self-limits to whatever
 // THIS machine + map can draw (fast hardware → ~display refresh; slow/large → fewer frames, coalescing the
-// rest). No fixed ms floor. NOTE: each full redraw still leaks a small residue of static resources (see the
-// KNOWN ISSUE at the canvas-draw section) — with unit batching in place, sustained hard scrubbing reaches
-// the 49152 pool cap after roughly ~3,500 redraws in one game session. Normal use doesn't approach that;
-// a throttle here would only stretch the fuse further at the cost of scrub responsiveness.
+// rest). No fixed ms floor. NOTE: the static-resource leak that once capped hard scrubbing (see the KNOWN
+// ISSUE at the canvas-draw section) came from the unit canvas, since replaced by DOM markers; the remaining
+// per-scrub draws are the batched state-layer fills, which measured ~leak-free.
 let seekPending = false, seekTargetX = 0, seekLastGi = -1;
 function renderSeekTarget() {
   if (!frames.length) return;
@@ -1031,7 +1744,7 @@ function scheduleSeek(clientX) {
 }
 function onSeekStart(e) { seeking = true; pause(); seekLastGi = -1; scheduleSeek(e.clientX); if (e.preventDefault) e.preventDefault(); }
 function onSeekMove(e) { if (seeking) scheduleSeek(e.clientX); }
-function onSeekEnd(e) { if (!seeking) return; seeking = false; seekTargetX = e.clientX; renderSeekTarget(); }   // final position, immediate + rebuilds the ribbon (seeking now false)
+function onSeekEnd(e) { if (!seeking) return; seeking = false; seekTargetX = e.clientX; renderSeekTarget(); }   // settle on the final frame (ribbon icons already updated live during the drag)
 // Scrubber hover tooltip: instead of an always-on counter, the turn-pill (els.label) shows the turn at the
 // cursor's position on the track — a video-style scrub preview. Updated ONLY when the previewed frame
 // changes (not on every pixel of movement) so it isn't churning the DOM/retained resources while scrubbing;
@@ -1052,8 +1765,9 @@ function onTrackHover(e) {
 function onTrackLeave() { lastHoverGi = -2; if (els.label) els.label.style.display = 'none'; }
 
 // --- hover tooltips ----------------------------------------------------------
-// The canvas is pointer-events:auto (so it's the cursor target over the map and suppresses the live-map
-// plot tooltip). On mouse-move we find the hovered hex and render OUR OWN tooltip div (see onMapHover).
+// The unit-marker container (unitDom) is pointer-events:auto (so it's the cursor target over the map and
+// suppresses the live-map plot tooltip). On mouse-move we find the hovered hex and render OUR OWN tooltip
+// div (see onMapHover).
 // Names are resolved live (owner id → player config), so no recorded data / version bump is needed.
 function playerName(id) {
   try {
@@ -1103,9 +1817,13 @@ function civAdjective(id) {
     return `Player ${id}`;
   } catch (e) { return `Player ${id}`; }
 }
-// City-state / independent display name (e.g. "Carthage") — from Players.get(id).civilizationFullName.
+// City-state / independent display name (e.g. "Carthage"). The RECORDED identity wins — a city-state
+// dispersed/absorbed before the viewed frame has no live Players entry (its tooltip used to degrade to
+// the bare "City-State" fallback while its units line still named it) — then live engine, then fallback.
 function cityStateName(id) {
   try {
+    const id2 = identityForPos().get(id);   // recorded [leader, civ, adj, ...] — composed at record time
+    if (id2 && id2[1] && !/^LOC_/.test(id2[1])) return id2[1];
     const L = (s) => (s && typeof Locale !== 'undefined' && Locale.compose) ? Locale.compose(s) : (s || '');
     const p = (typeof Players !== 'undefined' && Players.get) ? Players.get(id) : null;
     const n = p && p.civilizationFullName ? L(p.civilizationFullName) : '';
@@ -1267,7 +1985,11 @@ function positionTip(tip, e) {   // follow the cursor, clamped to the viewport
   if (y + r.height > vh) y = e.clientY - off - r.height;
   tip.style.left = Math.max(0, x) + 'px'; tip.style.top = Math.max(0, y) + 'px';
 }
-let lastHoverIdx = -2, lastTipText = '', ribbonHoverPid = null;
+// Instantaneous tooltip (the 100ms hover-intent delay was removed once instrumentation exonerated the
+// tooltip from the static-resource leak — tips measured 0-16/session while crashes raged elsewhere).
+// Content is rebuilt only when the hovered target changes; within a target the tip just follows the cursor.
+let ribbonHoverPid = null;
+let lastHoverIdx = -2, lastTipText = '';
 function hideTip() { if (lastHoverIdx !== -2 || lastTipText) { lastHoverIdx = -2; lastTipText = ''; if (els.tip) els.tip.style.display = 'none'; } }
 function onMapHover(e) {
   if (!mapVisible || !mapRoot) return;
@@ -1280,13 +2002,23 @@ function onMapHover(e) {
       if (row.__pid !== ribbonHoverPid) { ribbonHoverPid = row.__pid; applyRelationshipIcons(ribbonHoverPid); }
       lastHoverIdx = -2;   // force a map-tip refresh when the cursor moves back onto the map
       const text = ribbonTipText(row.__pid), tip = ensureTip();
-      if (text) { tip.innerHTML = tipHtml(text); lastTipText = text; tip.style.display = 'block'; positionTip(tip, e); }
+      if (text) { tip.innerHTML = tipHtml(text); lastTipText = text; tip.style.display = 'block'; positionTip(tip, e); HB.tips++; }
       else { lastTipText = ''; tip.style.display = 'none'; }
       return;
     }
   }
   if (ribbonHoverPid != null) { ribbonHoverPid = null; clearRelationshipIcons(); }   // left the ribbon → restore civ icons
-  // 2) The scrubber panel overlaps the top edge of the map; suppress the map tooltip when over it (hexAt
+  // 2) Fog checkbox is disabled in multiplayer: show the lock reason via OUR tooltip (z 2000005), which
+  // renders ABOVE the map/scrub layers — the game's native data-tooltip-content sits behind them, so only
+  // the text spilling past the map edge showed. Checked before the panel-suppress below since the fog
+  // control lives inside the panel.
+  if (fogLocked && els.fogToggleWrap && pointInRect(x, y, els.fogToggleWrap.getBoundingClientRect())) {
+    const tip = ensureTip();
+    if (lastTipText !== FOG_LOCK_TIP) { tip.innerHTML = tipHtml(FOG_LOCK_TIP); lastTipText = FOG_LOCK_TIP; lastHoverIdx = -2; HB.tips++; }
+    tip.style.display = 'block'; positionTip(tip, e);
+    return;
+  }
+  // 3) The scrubber panel overlaps the top edge of the map; suppress the map tooltip when over it (hexAt
   // is coordinate-based and would otherwise show the tile hidden beneath the panel).
   if (els.panel && els.panel.style.display !== 'none' && pointInRect(x, y, els.panel.getBoundingClientRect())) { hideTip(); return; }
   // 3) Map tooltip for the hovered tile.
@@ -1294,7 +2026,7 @@ function onMapHover(e) {
   if (idx !== lastHoverIdx) {   // hex changed → update content in place (no hide/show)
     lastHoverIdx = idx;
     lastTipText = idx >= 0 ? tooltipForHex(idx) : '';
-    if (lastTipText) ensureTip().innerHTML = tipHtml(lastTipText);
+    if (lastTipText) { ensureTip().innerHTML = tipHtml(lastTipText); HB.tips++; }   // HB counter
     else if (els.tip) els.tip.style.display = 'none';
   }
   if (!lastTipText) return;
@@ -1477,24 +2209,28 @@ function buildRibbon() {
     }
     const pic = row.__pic, sym = row.__sym;
     // Assigning an element's background-IMAGE binds a texture that is freed only when the element is destroyed
-    // — and these rows live forever (hide-not-remove). So re-binding a portrait/civ-symbol on every age crossing
-    // leaks, and jittering the scrubber across an age boundary overflows the 49152 pool. Only (re)bind images
-    // when the row is NEW or we're NOT mid-drag; during a drag the civ icon may be briefly stale, corrected on
-    // release. Membership (display) and the SOLID colors below are free, so those stay live while dragging.
-    const bindImg = isNew || !seeking;
+    // — and these rows live forever (hide-not-remove). Each rebind leaks, so we (re)bind only on a TRUE change:
+    // buildRibbon itself runs only when the ribbon signature (which includes each civ id) changes, and the
+    // per-row leaderType/civId guards below skip rows that didn't change — so a normal drag binds at most once
+    // per player per age boundary it actually crosses. The AUTOMATED harness stress-scrubs (ltMode) are the
+    // one case that can rack up thousands of boundary crossings, so those still defer rebinds; real user drags
+    // update live. Membership (display) and the SOLID colors below are free regardless.
+    const bindImg = isNew || !(ltMode === 'scrub' || ltMode === 'scrubR');
     if (bindImg && leaderType !== row.__leaderKey) {
       row.__leaderKey = leaderType; row.__leaderType = leaderType;
       setPicCss(pic, leaderPortraitCss(leaderType, null));   // neutral expression; hover swaps it (applyRelationshipIcons)
+      HB.rimg++;   // HB counter: each image rebind = a texture bind, freed only on element destruction
     }
     if (bindImg && civId !== row.__civKey) {
       row.__civKey = civId;
       const symbol = civSymbolFor(civId);
       row.__civSymUrl = symbol;
       sym.style.backgroundImage = symbol ? `url("${symbol}")` : '';
+      HB.rimg++;   // HB counter
     }
     if (bgc !== row.__bgc) { row.style.backgroundColor = bgc; row.__bgc = bgc; }
     if (border !== row.__border) { row.style.borderColor = border; pic.style.borderColor = border; row.__border = border; }
-    if (row.style.display === 'none') row.style.display = 'flex';
+    if (row.style.display === 'none') { row.style.display = 'flex'; HB.ribs++; }   // HB counter: re-shows re-register the row
   }
   for (const [pid, row] of ribbonRows) { if (!shown.has(pid) && row.style.display !== 'none') row.style.display = 'none'; }   // hide (don't remove) leaders not met at this frame — rows stay in their inserted pid order
 }
@@ -1615,8 +2351,9 @@ function buildPanel() {
   const bord = mkToggle('Borders', showBorders, (on) => { showBorders = on; redraw(); });
   const unit = mkToggle('Units', showUnits, (on) => { showUnits = on; redraw(); });
   const wond = mkToggle('Wonders', showWonders, (on) => { showWonders = on; redraw(); });
-  const fog = mkToggle('Fog', fogMode, (on) => { if (suppressFog) return; fogMode = on; markBgDirty(); redraw(); updateRibbon(); });
+  const fog = mkToggle('Fog', fogMode, (on) => { if (suppressFog || fogLocked) return; fogMode = on; markBgDirty(); redraw(); updateRibbon(); });
   els.fogToggleCb = fog.querySelector('fxs-checkbox');
+  els.fogToggleWrap = fog;
   const lead = mkToggle('Leaders', showLeaders, (on) => { showLeaders = on; updateRibbon(); });
   const rsrc = mkToggle('Resources', showResources, (on) => { showResources = on; redraw(); });
   const leftGroup = document.createElement('div'); leftGroup.style.cssText = `flex:1 1 0;min-width:0;display:flex;align-items:center;justify-content:flex-start;`;
@@ -1674,14 +2411,25 @@ function buildAgeBar() {
 }
 // endgameMode = shown via the Victories tab (the tab handles closing, so hide our X); false = in-game launcher.
 let endgameMode = false;
-// Fog-of-war defaults to the launch context: ON for the in-game launcher (don't spoil the live map), OFF
-// at the endgame Victories screen (the game's over — show everything). Sets the flag + syncs the toggle
-// (suppressed so it doesn't re-fire), but does NOT repaint — call this BEFORE a build so the first draw is
-// already correct, avoiding a second full redraw.
+// Fog-of-war defaults ON at every map open — in-game AND at the endgame Victories screen (user request:
+// the checkbox always starts checked; at endgame it can still be unchecked to reveal everything). In a
+// MULTIPLAYER game, while the game is still IN PROGRESS, fog is additionally LOCKED on (checkbox disabled
+// + native tooltip) so the replay can't scout other players — via EITHER the in-game minimap checkbox OR
+// the mid-game Victories→Rewind tab (endgameMode is true there, so we gate on isLocalGameOver(), not it).
+// Once the game is genuinely over the lock lifts. Sets the flags + syncs the toggle (suppressed so it
+// doesn't re-fire), but does NOT repaint — call this BEFORE a build so the first draw is already correct.
+const FOG_LOCK_TIP = "Can't disable fog in multiplayer!";
 function setFogFromContext() {
-  fogMode = !endgameMode;
+  fogMode = true;
+  fogLocked = isMultiplayerGame() && !isLocalGameOver();
   const cb = els.fogToggleCb;
-  if (cb) { suppressFog = true; try { cb.setAttribute('selected', fogMode ? 'true' : 'false'); } finally { suppressFog = false; } }
+  if (cb) {
+    suppressFog = true;
+    try { cb.setAttribute('selected', fogMode ? 'true' : 'false'); } finally { suppressFog = false; }
+    cb.setAttribute('disabled', fogLocked ? 'true' : 'false');
+  }
+  // The lock-reason tooltip is shown via OUR own tooltip in onMapHover (z 2000005, above the map/scrub) —
+  // NOT the native data-tooltip-content, which renders behind our high-z layers and gets clipped.
 }
 // Reveal an already-built map: one container toggle + show the scrubber. Cheap, never blocks. Only repaints
 // if the built/prebuilt image doesn't already match the desired fog state (fresh in-game builds already do).
@@ -1700,7 +2448,7 @@ function showIcelandBg() {
   let d = els.icelandBg;
   if (!d) {
     d = document.createElement('div'); d.id = 'rewind-iceland-bg';
-    d.style.cssText = `position:fixed;z-index:99990;display:none;background-image:url(bg-panel-iceland);background-size:cover;background-position:center;background-repeat:no-repeat;opacity:0.2;pointer-events:none;border-radius:${ps(8)}px;`;
+    d.style.cssText = `position:fixed;z-index:99980;display:none;background-image:url(bg-panel-iceland);background-size:cover;background-position:center;background-repeat:no-repeat;opacity:0.2;pointer-events:none;border-radius:${ps(8)}px;`;
     document.body.appendChild(d); els.icelandBg = d;
   }
   try { const a = measureArea(); d.style.left = a.x + 'px'; d.style.top = a.y + 'px'; d.style.width = a.w + 'px'; d.style.height = a.h + 'px'; d.style.display = 'block'; }
@@ -1711,6 +2459,9 @@ function reveal() {
   if (!els.panel) buildPanel();
   positionPanel();
   if (endgameMode) showIcelandBg(); else hideIcelandBg();   // score-tab backdrop, endgame only
+  // Lay the panel out but keep it INVISIBLE (visibility:hidden still measures; display:none wouldn't), so we
+  // can read its real height and re-center the map+scrub block BEFORE anything is shown — no visible jump.
+  els.panel.style.visibility = 'hidden';
   els.panel.style.display = 'flex';
   // Scale the control cluster to fit the map width. Setting display:flex forces a synchronous layout, so we
   // can measure + apply the scale RIGHT NOW, in the same frame — this avoids the glitch where a rAF-only fit
@@ -1718,6 +2469,7 @@ function reveal() {
   // full-size. The rAF/timeout re-runs are backups in case fonts/metrics settle a frame later. (Idempotent.)
   const fit = () => { try { fitControlRow(mapPxW); } catch (e) {} };
   fit();
+  els.panel.style.visibility = '';   // reveal the scrub panel
   try { requestAnimationFrame(() => { fit(); requestAnimationFrame(fit); }); } catch (e) {}
   try { setTimeout(fit, 130); } catch (e) {}
   if (els.label) els.label.style.display = 'none';   // turn pill shows only on scrubber hover
@@ -1743,6 +2495,11 @@ function nextPaint(fn) {   // run after a paint, so the tab transition animates 
 // Show the map without ever blocking the caller (the tab click): reveal a prebuilt map next frame,
 // wait on an in-flight build, or kick off a fresh chunked (non-blocking) build.
 function requestShow(usePlacard) {
+  // Record the CURRENT in-progress turn as the newest frame ("show me now"): the last recorded frame is
+  // otherwise the start-of-turn state, which reads as stale mid-turn. record() dedupes by (age, turn) and
+  // the end-of-turn recording overwrites this partial frame with the resolved one, so the convention
+  // self-heals. Must run BEFORE refresh() reads the manifest. (No-op in the shell scope / safe mode.)
+  try { if (typeof window.RewindRecordFinal === 'function') window.RewindRecordFinal(); } catch (e) {}
   if (!els.panel) buildPanel();
   setFogFromContext();   // set fog default BEFORE any build so the first draw is already correct (no second redraw)
   if (usePlacard) showLoading();
@@ -1773,6 +2530,10 @@ function closePanel() {
 // Background prebuild on Victories mount: chunked + hidden, so selecting the Rewind tab just reveals.
 function prebuild() {
   if ((prebuilt && layoutStillValid()) || building) return;
+  if (!els.panel) buildPanel();   // build the scrub panel first so computeLayout can measure its height for the pane reserve
+  // Endgame safety net: make sure the final resolved world state is recorded (e.g. after the local
+  // player's elimination, when no further turn events fire) BEFORE refresh() reads the manifest.
+  try { if (typeof window.RewindRecordFinal === 'function') window.RewindRecordFinal(); } catch (e) {}
   refresh();
   if (frames.length && cellByIndex) { buildChunked(frameFor(pos)); log('prebuild started (chunked, hidden)'); }
 }
