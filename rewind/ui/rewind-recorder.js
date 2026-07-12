@@ -46,7 +46,8 @@
  *     0 deep ocean | 1 coastal sea | 2 mountain | 3 desert | 4 plains |
  *     5 grassland | 6 tropical | 7 tundra | 8 other land | 9 lake | 10 navigable river
  *   key "natural" → plotIndexes that are NATURAL wonders (captured once)
- *   key "res_<ageId>" → [[plot, resourceClassCode], …] per age (see RESOURCE_CLASS_CODE)
+ *   key "res_<ageId>" → [[plot, resourceClassCode, resourceType], …] per age (class → dot color via
+ *       RESOURCE_CLASS_CODE; type → exact resource name in the tooltip. Older recordings omit the 3rd field.)
  *
  * plotIndex is the engine index (GameplayMap.getIndexFromXY / getLocationFromIndex).
  * Reconstruction: nearest snapshot <= gi, then apply diffs forward (rewind-playback.js).
@@ -677,7 +678,10 @@ function captureResources() {
       if (rt == null || (typeof ResourceTypes !== 'undefined' && rt === ResourceTypes.NO_RESOURCE)) continue;
       let cls = null; try { const def = GameInfo.Resources.lookup(rt); cls = def && def.ResourceClassType; } catch (e) {}
       const code = RESOURCE_CLASS_CODE[cls];
-      if (code != null) out.push([i, code]);
+      // Store the resource TYPE (rt) alongside the class code: the code drives the map dot's color, rt lets the
+      // tooltip resolve the exact historical resource name from the same recorded snapshot as the dot (reading
+      // the live map instead diverges — harvested/age-changed resources leave a dot with no name).
+      if (code != null) out.push([i, code, rt]);
     }
     getCatalog().getObject(OBJ_BASE).write(KEY_RES + '_' + Game.age, JSON.stringify(out));
     log(`captured ${out.length} resources for age ${Game.age}`);

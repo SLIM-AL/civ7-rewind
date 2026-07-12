@@ -135,15 +135,24 @@ function readUnitsTurn(t) {
 // in-game resource-class icons (0 bonus green, 1 city blue, 2 empire amber, 3 treasure gold, 4 factory teal).
 const KEY_RES = 'res';
 const RESOURCE_COLOR = ['#5faa38', '#4a88cc', '#d7a03a', '#e6c144', '#43b598'];
-const resCache = new Map();   // ageId -> Map(plotIndex -> classCode)
+const resCache = new Map();       // ageId -> Map(plotIndex -> classCode)     [dot color]
+const resTypeCache = new Map();   // ageId -> Map(plotIndex -> resourceType)  [tooltip name; empty for old recordings]
 function readResourcesForAge(ageId) {
   if (resCache.has(ageId)) return resCache.get(ageId);
-  const m = new Map();
-  try { const raw = getCatalog().getObject(OBJ_BASE).read(KEY_RES + '_' + ageId); if (raw) { const a = JSON.parse(raw); if (Array.isArray(a)) for (const e of a) m.set(e[0], e[1]); } } catch (e) { err(`resources ${ageId} read: ${e}`); }
-  resCache.set(ageId, m);
+  const m = new Map(), mt = new Map();
+  try { const raw = getCatalog().getObject(OBJ_BASE).read(KEY_RES + '_' + ageId); if (raw) { const a = JSON.parse(raw); if (Array.isArray(a)) for (const e of a) { m.set(e[0], e[1]); if (e[2] != null) mt.set(e[0], e[2]); } } } catch (e) { err(`resources ${ageId} read: ${e}`); }
+  resCache.set(ageId, m); resTypeCache.set(ageId, mt);
   return m;
 }
 function resourcesForPos() { return frames.length ? readResourcesForAge(frames[pos][0]) : new Map(); }
+// Recorded resource TYPE at plot i for the current frame's age (null if none / old recording without types).
+function resourceTypeForPos(i) {
+  if (!frames.length) return null;
+  const ageId = frames[pos][0];
+  if (!resTypeCache.has(ageId)) readResourcesForAge(ageId);   // populates resTypeCache as a side effect
+  const mt = resTypeCache.get(ageId);
+  return mt ? mt.get(i) : null;
+}
 function readNatural() {   // static list of natural-wonder plot indexes
   try { const raw = getCatalog().getObject(OBJ_BASE).read(KEY_NATURAL); if (raw) { const a = JSON.parse(raw); if (Array.isArray(a)) return a; } } catch (e) { err(`natural read: ${e}`); }
   return [];
@@ -1666,7 +1675,7 @@ function refresh() {
   const recordingChanged = fp !== lastRecordingFp;
   lastRecordingFp = fp;
   if (recordingChanged) {
-    turnCache.clear(); unitsCache.clear(); suzeCache.clear(); playersCache.clear(); ownerColorCache.clear(); resCache.clear(); curBuildingsPos = -2; curSettlementsPos = -2; curVisPos = -2; curIdentityPos = -2; curRelPos = -2; curWondersPos = -2; ribbonSigLast = null;   // records re-read fresh (cheap; cleared for new-game safety)
+    turnCache.clear(); unitsCache.clear(); suzeCache.clear(); playersCache.clear(); ownerColorCache.clear(); resCache.clear(); resTypeCache.clear(); curBuildingsPos = -2; curSettlementsPos = -2; curVisPos = -2; curIdentityPos = -2; curRelPos = -2; curWondersPos = -2; ribbonSigLast = null;   // records re-read fresh (cheap; cleared for new-game safety)
     recycleAllLayers(); lastStatePos = -2; lastStateSig = ''; lastSuzeSig = ''; lastStateFrame = null; conquestEpisodes = null;   // per-age canvases + state gate + conquest table hold frame-derived content → same new-game safety
   }
   frames = framesNow;   // already in chronological (gi) order
@@ -1918,12 +1927,13 @@ function naturalWonderName(i) {
   } catch (e) { return ''; }
 }
 function wonderNameForHex(i) { return manMadeWonderName(i) || naturalWonderName(i); }
-// Resource name at a plot — resolved live from the (static) map, or ''.
+// Resource name at a plot — from the RECORDED per-age snapshot (same source as the dot), so it always matches
+// what's drawn. Reading the live map instead diverged: harvested or age-changed resources kept a dot but the
+// live query returned NO_RESOURCE, leaving a resource hex with an empty tooltip. '' when none / old recording.
 function resourceNameForHex(i) {
   try {
-    const loc = GameplayMap.getLocationFromIndex(i);
-    const rt = GameplayMap.getResourceType(loc.x, loc.y);
-    if (rt == null || (typeof ResourceTypes !== 'undefined' && rt === ResourceTypes.NO_RESOURCE)) return '';
+    const rt = resourceTypeForPos(i);
+    if (rt == null) return '';
     const def = GameInfo.Resources.lookup(rt);
     return def && def.Name ? L(def.Name) : '';
   } catch (e) { return ''; }
