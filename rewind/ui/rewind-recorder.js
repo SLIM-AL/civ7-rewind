@@ -136,8 +136,14 @@ function tileClass(loc) {
  */
 function markCenters(cls) {
   try {
-    const players = (typeof Players !== 'undefined' && Players.getAlive) ? Players.getAlive() : [];
-    for (const player of players) {
+    // Iterate ALL player ids (not Players.getAlive()): a player who has RETIRED/been defeated but whose
+    // settlements still stand on the map is dropped from getAlive(), yet remains a major with cities — so
+    // getAlive() left their town centers at tileClass()=2 (CITY_CENTER district) and they drew the city dot
+    // on the retire turn. This mirrors readSettlements (the tooltip's type channel), which is why the tooltip
+    // stayed correct while the dot didn't.
+    for (let pid = 0; pid <= MAX_PLAYER_ID; pid++) {
+      const player = Players.get(pid);
+      if (!player) continue;
       if (player.isIndependent) {
         const cons = player.Constructibles?.getConstructibles?.();
         if (cons) for (const con of cons) {

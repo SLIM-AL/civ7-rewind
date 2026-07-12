@@ -2193,12 +2193,28 @@ function buildRibbon() {
     if (isNew) {
       row = document.createElement('div'); row.__pid = pid;
       row.style.cssText = `display:flex;align-items:center;margin:0 ${ps(3)}px ${ps(4)}px;border:${ps(1)}px solid #000;border-radius:${ps(16)}px;padding:${ps(2)}px ${ps(7)}px ${ps(2)}px ${ps(2)}px;pointer-events:auto;box-shadow:0 ${ps(1)}px ${ps(4)}px rgba(0,0,0,0.5);`;
+      // pic is a circular-clip CONTAINER holding the leader's expression layers (neutral/happy/angry), each
+      // bound once and toggled by display — so the hover reaction swap is a free show/hide, not a rebind. Each
+      // layer carries its OWN border-radius:50% (the mechanism the original single-div portrait relied on to
+      // clip its background to the circle); overflow:hidden is belt-and-suspenders. Border + dark backfill
+      // stay on the container, showing through the portrait's transparent areas as before.
       const pic = document.createElement('div');
-      pic.style.cssText = `flex:0 0 auto;width:${ps(28)}px;height:${ps(28)}px;border-radius:50%;border:${ps(1)}px solid #000;background-color:#0b0f18;background-size:cover;background-position:center;`;
+      pic.style.cssText = `flex:0 0 auto;position:relative;overflow:hidden;width:${ps(28)}px;height:${ps(28)}px;border-radius:50%;border:${ps(1)}px solid #000;background-color:#0b0f18;`;
+      // sym holds a stack of civ-symbol layers (one per civ this leader has held) AND relationship-icon layers
+      // (one per relationship code), each bound ONCE and switched by a display toggle — only one is ever
+      // visible, so no background-image is reassigned on scrub OR hover after each layer's first appearance.
+      // The old code reassigned a single element's backgroundImage on every age crossing; each reassign
+      // registers a Gameface static resource (~6-14 pool items) AND, interleaved with the same frame's
+      // territory/border canvas fills, defeats Renoir's per-flush fill de-dup (fills jump ~0.23→~1 item/call)
+      // — that combination was the Leaders×Territory/Borders scrub crash.
       const sym = document.createElement('div');
-      sym.style.cssText = `flex:0 0 auto;width:${ps(22)}px;height:${ps(22)}px;margin-left:${ps(6)}px;background-size:contain;background-position:center;background-repeat:no-repeat;`;
-      row.__pic = pic; row.__sym = sym; row.append(pic, sym);
-      row.__leaderKey = row.__civKey = undefined; row.__bgc = row.__border = null; row.__civSymUrl = '';   // force first apply
+      sym.style.cssText = `flex:0 0 auto;position:relative;width:${ps(22)}px;height:${ps(22)}px;margin-left:${ps(6)}px;`;
+      row.__pic = pic; row.__sym = sym;
+      row.__picLayers = new Map(); row.__picShown = null;
+      row.__symLayers = new Map(); row.__relLayers = new Map();
+      row.__curCiv = ''; row.__curCivLayer = null; row.__symShown = null;
+      row.append(pic, sym);
+      row.__leaderKey = undefined; row.__bgc = row.__border = null;   // force first apply
       ribbonRows.set(pid, row);
       // Insert in pid order at creation so we NEVER have to move a row afterward — re-appending an existing
       // row re-registers its box-shadow (a static resource) in Coherent, which overflowed the 49152 pool
@@ -2207,27 +2223,15 @@ function buildRibbon() {
       for (const ch of r.children) { if (ch.__pid != null && ch.__pid > pid) { before = ch; break; } }
       r.insertBefore(row, before);
     }
-    const pic = row.__pic, sym = row.__sym;
-    // Assigning an element's background-IMAGE binds a texture that is freed only when the element is destroyed
-    // — and these rows live forever (hide-not-remove). Each rebind leaks, so we (re)bind only on a TRUE change:
-    // buildRibbon itself runs only when the ribbon signature (which includes each civ id) changes, and the
-    // per-row leaderType/civId guards below skip rows that didn't change — so a normal drag binds at most once
-    // per player per age boundary it actually crosses. The AUTOMATED harness stress-scrubs (ltMode) are the
-    // one case that can rack up thousands of boundary crossings, so those still defer rebinds; real user drags
-    // update live. Membership (display) and the SOLID colors below are free regardless.
-    const bindImg = isNew || !(ltMode === 'scrub' || ltMode === 'scrubR');
-    if (bindImg && leaderType !== row.__leaderKey) {
+    const pic = row.__pic;
+    // Non-hover resting state: neutral portrait + the current age's civ symbol. Both are pre-bound layer
+    // toggles (showPic/showCivSym) — a texture bind happens only the FIRST time a given expression/civ appears
+    // for this row, then every later switch (scrub across ages, hover in/out) is a free display change.
+    if (leaderType !== row.__leaderKey) {
       row.__leaderKey = leaderType; row.__leaderType = leaderType;
-      setPicCss(pic, leaderPortraitCss(leaderType, null));   // neutral expression; hover swaps it (applyRelationshipIcons)
-      HB.rimg++;   // HB counter: each image rebind = a texture bind, freed only on element destruction
+      showPic(row, null);   // neutral expression; hover swaps to happy/angry via applyRelationshipIcons
     }
-    if (bindImg && civId !== row.__civKey) {
-      row.__civKey = civId;
-      const symbol = civSymbolFor(civId);
-      row.__civSymUrl = symbol;
-      sym.style.backgroundImage = symbol ? `url("${symbol}")` : '';
-      HB.rimg++;   // HB counter
-    }
+    if (civId !== row.__curCiv) showCivSym(row, civId);
     if (bgc !== row.__bgc) { row.style.backgroundColor = bgc; row.__bgc = bgc; }
     if (border !== row.__border) { row.style.borderColor = border; pic.style.borderColor = border; row.__border = border; }
     if (row.style.display === 'none') { row.style.display = 'flex'; HB.ribs++; }   // HB counter: re-shows re-register the row
@@ -2261,8 +2265,72 @@ function relIconUrl(code) {
   if (out) _relIconCache.set(code, out);
   return out;
 }
-function setSymIcon(symEl, url) { if (symEl) symEl.style.backgroundImage = url ? `url("${url}")` : ''; }
-function setPicCss(picEl, css) { if (picEl) picEl.style.backgroundImage = css || ''; }
+// Pre-bound ribbon-icon layers (see buildRibbon). The `sym` slot holds civ-symbol layers (one per civ this
+// leader has held) and relationship-icon layers (one per relationship code); the `pic` slot holds portrait
+// expression layers (neutral/happy/angry). Each layer's image is bound ONCE on first appearance; only one is
+// ever visible, and switching is a pure display toggle — which registers no texture, so it can neither leak
+// pool items nor defeat the canvas fill de-dup. After warmup the ribbon does ZERO image rebinds.
+function showSymLayer(row, layer) {   // exactly one sym layer (a civ symbol or a rel icon) visible at a time
+  if (row.__symShown && row.__symShown !== layer) row.__symShown.style.display = 'none';
+  if (layer) layer.style.display = 'block';
+  row.__symShown = layer;
+}
+function ensureCivLayer(row, civId) {
+  let layer = row.__symLayers.get(civId);
+  if (!layer) {
+    layer = document.createElement('div');
+    layer.style.cssText = `position:absolute;left:0;top:0;width:100%;height:100%;background-size:contain;background-position:center;background-repeat:no-repeat;display:none;`;
+    const symbol = civSymbolFor(civId);
+    layer.style.backgroundImage = symbol ? `url("${symbol}")` : '';   // bound ONCE, never reassigned
+    row.__sym.appendChild(layer);
+    row.__symLayers.set(civId, layer);
+    HB.rimg++;   // the single texture bind for this (leader, civ) pair
+  }
+  return layer;
+}
+function showCivSym(row, civId) {
+  const layer = ensureCivLayer(row, civId);
+  row.__curCiv = civId; row.__curCivLayer = layer;   // remembered so a hover clear can restore it
+  showSymLayer(row, layer);
+}
+function restoreCivSym(row) { showSymLayer(row, row.__curCivLayer); }   // hover cleared / unmet pair → civ icon
+function ensureRelLayer(row, code) {
+  let layer = row.__relLayers.get(code);
+  if (!layer) {
+    const url = relIconUrl(code);
+    layer = document.createElement('div');
+    layer.style.cssText = `position:absolute;left:0;top:0;width:100%;height:100%;background-size:contain;background-position:center;background-repeat:no-repeat;display:none;`;
+    layer.style.backgroundImage = url ? `url("${url}")` : '';
+    layer.__hasIcon = !!url;
+    row.__sym.appendChild(layer);
+    row.__relLayers.set(code, layer);
+    HB.rimg++;   // one bind per (leader, relationship-code) pair
+  }
+  return layer;
+}
+function showRelSym(row, code) {   // met pair on hover → relationship icon; icon missing → keep the civ symbol
+  const layer = ensureRelLayer(row, code);
+  if (layer.__hasIcon) showSymLayer(row, layer); else restoreCivSym(row);
+}
+// Portrait expression layers: neutral (code null/0), happy (1/3), angry (2/4). One layer per bucket, bound
+// once; switching the reaction on hover is a display toggle. Each layer carries border-radius:50% so its
+// background clips to the avatar circle (matching the original single-div portrait).
+function showPic(row, code) {
+  const bucket = (code === 1 || code === 3) ? 'h' : (code === 2 || code === 4) ? 'a' : 'n';
+  let layer = row.__picLayers.get(bucket);
+  if (!layer) {
+    const canon = bucket === 'h' ? 1 : bucket === 'a' ? 2 : null;   // one cache entry / bind per bucket
+    layer = document.createElement('div');
+    layer.style.cssText = `position:absolute;left:0;top:0;width:100%;height:100%;border-radius:50%;background-size:cover;background-position:center;display:none;`;
+    layer.style.backgroundImage = leaderPortraitCss(row.__leaderType, canon) || '';
+    row.__pic.appendChild(layer);
+    row.__picLayers.set(bucket, layer);
+    HB.rimg++;   // one bind per (leader, expression) bucket
+  }
+  if (row.__picShown && row.__picShown !== layer) row.__picShown.style.display = 'none';
+  layer.style.display = 'block';
+  row.__picShown = layer;
+}
 // Leader portrait as a CSS background-image, with a facial-expression CONTEXT (LEADER_HAPPY for friendly/
 // alliance, LEADER_ANGRY for hostile/war, default/neutral otherwise) — the same mechanism fxs-icon uses:
 // UI.getIconCSS(leaderTypeString, context). Falls back to the neutral portrait if the expression is missing.
@@ -2295,15 +2363,15 @@ function applyRelationshipIcons(hoverPid) {
   const rel = relationshipForPos(), kids = els.ribbon ? els.ribbon.children : [];
   for (let k = 0; k < kids.length; k++) {
     const row = kids[k], pid = row.__pid; if (pid == null) continue;
-    if (pid === hoverPid) { setSymIcon(row.__sym, row.__civSymUrl); setPicCss(row.__pic, leaderPortraitCss(row.__leaderType, null)); continue; }
+    if (pid === hoverPid) { restoreCivSym(row); showPic(row, null); continue; }
     const code = rel.get(Math.min(hoverPid, pid) + ',' + Math.max(hoverPid, pid));
-    setSymIcon(row.__sym, (code != null ? relIconUrl(code) : '') || row.__civSymUrl);   // unmet pair → keep civ icon
-    setPicCss(row.__pic, leaderPortraitCss(row.__leaderType, code != null ? code : 0));  // reaction expression (neutral if unknown)
+    if (code != null) showRelSym(row, code); else restoreCivSym(row);   // met pair → relationship icon; unmet → keep civ icon
+    showPic(row, code != null ? code : 0);   // reaction expression layer (neutral if unmet)
   }
 }
 function clearRelationshipIcons() {
   const kids = els.ribbon ? els.ribbon.children : [];
-  for (let k = 0; k < kids.length; k++) { setSymIcon(kids[k].__sym, kids[k].__civSymUrl); setPicCss(kids[k].__pic, leaderPortraitCss(kids[k].__leaderType, null)); }
+  for (let k = 0; k < kids.length; k++) { restoreCivSym(kids[k]); showPic(kids[k], null); }
 }
 // Hit-test by COORDINATES (rect), not event.target — Gameface reports the map canvas as the mousemove
 // target even when the cursor is over UI overlapping it, so e.target can't tell us what's really hovered.
