@@ -273,19 +273,12 @@ const VictoriesScreenWithRewind = (props) => {
   });
 };
 
-// Safe mode (main-menu toggle): skip the VictoriesScreen override entirely. This is the riskiest
-// piece (it replaces a base screen), so the escape hatch must neutralize it.
-function rewindDisabled() { try { return UI.getOption('user', 'Interface', 'RewindDisabled') == 1; } catch (e) { return false; } }
-if (rewindDisabled()) {
-  log('safe mode ON — skipping VictoriesScreen override');
-} else {
-  try {
-    ComponentRegistry.register({
-      name: "VictoriesScreen",
-      styles: [style],
-      overridePriority: 100,
-      createInstance: VictoriesScreenWithRewind
-    });
-    log('endgame tab: registered VictoriesScreen override (+Rewind tab)');
-  } catch (e) { err(`endgame tab register failed: ${e}`); }
-}
+try {
+  ComponentRegistry.register({
+    name: "VictoriesScreen",
+    styles: [style],
+    overridePriority: 100,
+    createInstance: VictoriesScreenWithRewind
+  });
+  log('endgame tab: registered VictoriesScreen override (+Rewind tab)');
+} catch (e) { err(`endgame tab register failed: ${e}`); }

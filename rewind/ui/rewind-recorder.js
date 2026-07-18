@@ -827,41 +827,10 @@ function record(turn, forceSnap) {
   log(`frame ${gi} (age ${ageId} turn ${turn}) ${snapshot ? 'SNAPSHOT' : 'diff'}: ${terr.length} territory ${snapshot ? 'owned-plots' : 'changes'}, ${set.length} settlement ${snapshot ? '' : 'changes, '}${vis.length} vis, ${units.length} units, ${won.length} wonder ${snapshot ? '' : 'changes, '}${suze.length} suzerained (frames=${manifest.frames.length})`);
 }
 
-// On-screen badge (bottom-left, opt-in via Options > Rewind) showing WHEN the recorder does OUR work,
-// with a timing: loading (capturing the map), recording a turn (reading state + writing our data to the
-// store — i.e. the mod data that ends up in the save), and auto-deleting. We deliberately do NOT time
-// the game's own save (the SaveComplete event covers the whole engine save, not just our portion). Off
-// by default.
-function nowMs() { try { return (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now(); } catch (e) { return Date.now(); } }
-function loadBadgeEnabled() { try { return UI.getOption('user', 'Interface', 'RewindShowLoadBadge') == 1; } catch (e) { return false; } }
-let badgeHideTimer = null;
-function showLoadBadge(text) {
-  try {
-    if (!loadBadgeEnabled()) return;   // opt-in via Options > Rewind (default off)
-    if (typeof document === 'undefined' || !document.body) return;
-    if (badgeHideTimer) { clearTimeout(badgeHideTimer); badgeHideTimer = null; }   // don't let a pending hide cut a new message off
-    let b = document.getElementById('rewind-load-badge');
-    if (!b) {
-      b = document.createElement('div'); b.id = 'rewind-load-badge';
-      b.style.cssText = 'position:fixed;left:12px;bottom:12px;z-index:2000000;padding:6px 12px;background:rgba(16,22,34,0.9);color:#cdddff;border:1px solid #6a88bb;border-radius:6px;font-family:monospace;font-size:13px;pointer-events:none;';
-      document.body.appendChild(b);
-    }
-    b.textContent = text; b.style.display = 'block';
-  } catch (e) { }
-}
-function hideLoadBadge(delayMs) {
-  try {
-    const b = document.getElementById('rewind-load-badge'); if (!b) return;
-    if (badgeHideTimer) clearTimeout(badgeHideTimer);
-    badgeHideTimer = setTimeout(() => { try { b.style.display = 'none'; } catch (e) { } badgeHideTimer = null; }, delayMs || 0);
-  } catch (e) { }
-}
-
 // --- lifecycle ---------------------------------------------------------------
 function init(evtName) {
   if (started) return;
   started = true;
-  showLoadBadge('Rewind: reading map…');
   try {
     mapW = GameplayMap.getGridWidth();
     mapH = GameplayMap.getGridHeight();
@@ -873,9 +842,7 @@ function init(evtName) {
     // Game.turn-1: at game start (turn 1) this is the turn-0 baseline; on resume it re-snapshots the last
     // completed turn (Game.turn-1), which also re-establishes the diff baseline. record() dedups by (age,turn).
     record(Game.turn - 1, true);
-    showLoadBadge(`Rewind: recording active (turn ${Game.turn})`);
-    hideLoadBadge(5000);
-  } catch (e) { err(`init failed: ${e}`); showLoadBadge('Rewind: init error (see log)'); hideLoadBadge(8000); }
+  } catch (e) { err(`init failed: ${e}`); }
 }
 
 function onTurnBegin() {
@@ -884,10 +851,7 @@ function onTurnBegin() {
     // labeled N-1. record() forces a snapshot itself on a new age (turn numbers reset per age).
     const turn = Game.turn - 1;
     if (turn === lastTurnRecorded) return;
-    const t0 = nowMs();
     record(turn, false);
-    showLoadBadge(`Rewind: recorded turn ${turn} (${(nowMs() - t0).toFixed(0)}ms)`);
-    hideLoadBadge(4000);
   } catch (e) { err(`onTurnBegin failed: ${e}`); }
 }
 // Final-state capture: the last turn of a game (or of an age) is never reached by a following turn-begin, so
@@ -918,37 +882,15 @@ function onPlayerDefeat(data) {
 }
 // Endgame-screen safety net: rewind-playback calls this when the Victories screen mounts, so whatever
 // path led to the end screen, the final resolved world state is in the replay before the map builds.
-try { window.RewindRecordFinal = () => { try { if (!rewindDisabled() && started) onGameOrAgeEnd('endgame-screen'); } catch (e) {} }; } catch (e) {}
+try { window.RewindRecordFinal = () => { try { if (started) onGameOrAgeEnd('endgame-screen'); } catch (e) {} }; } catch (e) {}
 
-// Auto-delete (Options > Rewind): wipe stored data at the end of every turn so saves never accumulate a
-// replay. Leaves nothing behind (no re-snapshot); the next turn begins recording a fresh baseline.
-function rewindAutoDelete() { try { return UI.getOption('user', 'Interface', 'RewindAutoDelete') == 1; } catch (e) { return false; } }
-function onTurnEnd() {
-  try {
-    if (rewindAutoDelete()) {
-      const t0 = nowMs();
-      clearData(false);
-      log('auto-delete: wiped replay data on turn end');
-      showLoadBadge(`Rewind: cleared data (${(nowMs() - t0).toFixed(0)}ms)`);
-      hideLoadBadge(4000);
-    }
-  } catch (e) { err(`onTurnEnd failed: ${e}`); }
-}
-
-// Safe mode (Options > Rewind): keep the mod loaded but inert, so saves still load.
-function rewindDisabled() { try { return UI.getOption('user', 'Interface', 'RewindDisabled') == 1; } catch (e) { return false; } }
-if (rewindDisabled()) {
-  log('safe mode ON — recorder inert (mod stays loaded so saves keep loading)');
-} else {
-  log('recorder module loaded — binding lifecycle events');
-  engine.on('GameStarted', () => init('GameStarted'));
-  engine.on('LoadComplete', () => init('LoadComplete'));
-  engine.on('LocalPlayerTurnBegin', onTurnBegin);
-  engine.on('LocalPlayerTurnEnd', onTurnEnd);
-  engine.on('GameAgeEnded', () => onGameOrAgeEnd('GameAgeEnded'));   // captures each age's final resolved state (final age = game over)
-  engine.on('TeamVictory', () => onGameOrAgeEnd('TeamVictory'));     // victory-triggered game over
-  engine.on('PlayerDefeat', onPlayerDefeat);                         // local elimination → capture the post-conquest final state
-  try {
-    if (typeof UI !== 'undefined' && UI.isInGame && UI.isInGame()) init('module-load');
-  } catch (e) { /* events will cover it */ }
-}
+log('recorder module loaded — binding lifecycle events');
+engine.on('GameStarted', () => init('GameStarted'));
+engine.on('LoadComplete', () => init('LoadComplete'));
+engine.on('LocalPlayerTurnBegin', onTurnBegin);
+engine.on('GameAgeEnded', () => onGameOrAgeEnd('GameAgeEnded'));   // captures each age's final resolved state (final age = game over)
+engine.on('TeamVictory', () => onGameOrAgeEnd('TeamVictory'));     // victory-triggered game over
+engine.on('PlayerDefeat', onPlayerDefeat);                         // local elimination → capture the post-conquest final state
+try {
+  if (typeof UI !== 'undefined' && UI.isInGame && UI.isInGame()) init('module-load');
+} catch (e) { /* events will cover it */ }

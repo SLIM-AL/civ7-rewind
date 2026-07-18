@@ -3,15 +3,19 @@
 	xmlns="ModInfo">
 	<Properties>
 		<Name>REWIND: Replay Map History</Name>
-		<Description>Records your game turn-by-turn and replays it as an animated hex-map timelapse — territory, borders, cities, units, wonders and resources across the whole game. Watch it in a new Rewind tab on the end-game Victories screen, or live from a checkbox by the minimap (with or without fog). It is save-affecting: a game saved with it lists it as required so recording survives save/reload. A soft-disable setting is provided to allow disabling without invalidating saves.</Description>
+		<Description>Records your game turn-by-turn and replays it as an animated hex-map timelapse — territory, borders, cities, units, wonders and resources across the whole game. Watch it in a new Rewind tab on the end-game Victories screen, or live from a checkbox by the minimap (with or without fog).</Description>
 		<Authors>SLIM_AL</Authors>
 		<EnabledByDefault>1</EnabledByDefault>
 		<ShowInBrowser>1</ShowInBrowser>
+		<AffectsSavedGames>0</AffectsSavedGames>
 	</Properties>
-	<!-- DELIBERATELY save-affecting (AffectsSavedGames omitted → default save-affecting).
-	     A recorder MUST be restored on load to keep recording across save/reload, and the
-	     engine only restores mods that are in the save's requiredMods list, i.e. save-affecting
-	     ones. Do NOT add <AffectsSavedGames>0</AffectsSavedGames>. -->
+	<!-- NON-save-affecting (AffectsSavedGames=0): a game saved with Rewind active does NOT list it as a
+	     required mod, so those saves keep loading even if the player later disables or removes Rewind, or
+	     it gets renamed. The recorder still restores itself on load as long as the mod stays enabled in
+	     Add-Ons (the default), so recording survives save/reload in normal play. This deliberately replaces
+	     the earlier save-affecting design and its soft-disable option, which risked blocking old saves from
+	     loading. NOTE: the required-mod match is on BOTH id AND display Name — never change either or
+	     existing save-affecting saves (from the old design) will refuse to load. -->
 	<Dependencies>
 		<Mod id="base-standard" title="LOC_MODULE_BASE_STANDARD_NAME"/>
 	</Dependencies>
@@ -30,21 +34,6 @@
 					<Item>ui/rewind-recorder.js</Item>
 					<Item>ui/rewind-playback.js</Item>
 					<Item>ui/rewind-endgame-tab.js</Item>
-					<Item>ui/rewind-options.js</Item>
-				</UIScripts>
-			</Actions>
-		</ActionGroup>
-		<!-- Shell (main menu) scope: the Options-menu integration (Game > Rewind). Lets a player neutralize
-		     the mod via the RewindDisabled user-option WITHOUT disabling it in Add-Ons (which would block
-		     their saves from loading, since the mod is save-affecting). The Options screen is reachable from
-		     the main menu, so this stays usable even if an in-game bug appears. -->
-		<ActionGroup id="rewind-shell" scope="shell" criteria="always">
-			<Actions>
-				<UpdateText>
-					<Item>text/en_us/RewindOptionsText.xml</Item>
-				</UpdateText>
-				<UIScripts>
-					<Item>ui/rewind-options.js</Item>
 				</UIScripts>
 			</Actions>
 		</ActionGroup>

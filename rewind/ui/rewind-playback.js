@@ -2697,14 +2697,8 @@ function onEnterGame(evt) {
     setInterval(() => { ensureRewindCheckbox(); if (!document.getElementById('rewind-cb')) armCheckboxObserver(); }, 1000);
   }
 }
-// Safe mode (main-menu toggle): keep the mod loaded but inert (no launcher / map UI), so saves still load.
-function rewindDisabled() { try { return UI.getOption('user', 'Interface', 'RewindDisabled') == 1; } catch (e) { return false; } }
-if (rewindDisabled()) {
-  log('safe mode ON — playback UI inert');
-} else {
-  log('playback UI module loaded — binding lifecycle events');
-  engine.on('GameStarted', () => onEnterGame('GameStarted'));
-  engine.on('LoadComplete', () => onEnterGame('LoadComplete'));
-  try { window.addEventListener('view-changed', onViewChanged); } catch (e) { }
-  try { if (typeof UI !== 'undefined' && UI.isInGame && UI.isInGame()) onEnterGame('module-load'); } catch (e) { }
-}
+log('playback UI module loaded — binding lifecycle events');
+engine.on('GameStarted', () => onEnterGame('GameStarted'));
+engine.on('LoadComplete', () => onEnterGame('LoadComplete'));
+try { window.addEventListener('view-changed', onViewChanged); } catch (e) { }
+try { if (typeof UI !== 'undefined' && UI.isInGame && UI.isInGame()) onEnterGame('module-load'); } catch (e) { }
