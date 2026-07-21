@@ -18,7 +18,7 @@ checkbox next to the minimap (with or without fog of war).
 
 ## Install
 
-**Steam Workshop:** subscribe to the item (link TBD).
+**Steam Workshop:** subscribe to the item at https://steamcommunity.com/sharedfiles/filedetails/?id=3759409080.
 
 **Manual:** copy the `rewind/` folder into your Civilization VII `Mods` directory, e.g.
 
@@ -27,17 +27,9 @@ checkbox next to the minimap (with or without fog of war).
 
 then fully restart the game and enable it in **Add-Ons**.
 
-## Options (Game → Rewind)
-
-- **Disable Rewind** — soft-disables the mod without removing it, so existing saves still load.
-- **Delete replay data on turn end** — keeps save size down by discarding the recording each turn.
-
 ## Notes
 
-This mod is **save-affecting** by design: a game saved with it lists it as required, so the
-recording survives save/reload. That means fully disabling it in Add-Ons will prevent those saves
-from loading — use the in-game **Disable Rewind** option instead if you want to neutralize it
-without invalidating saves.
+Previous versions of this mod were save affecting, but is no longer the case. This means enabling/disabling this mod will no longer impact your ability to load old saves.
 
 ## Development
 
