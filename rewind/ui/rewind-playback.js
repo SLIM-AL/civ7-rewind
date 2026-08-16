@@ -2187,6 +2187,26 @@ function ribbonSig() { return ribbonMajors().map(([pid, e]) => `${pid}:${e[3]}:$
 // down (innerHTML='') and recreated every row each rebuild — those images + box-shadows were retained
 // Gameface "static resources" that were never freed, so scrubbing across ages overflowed the 49152 pool.
 let ribbonRows = new Map();   // pid -> row element, created once and reused
+let selectedLeaderPid = null;
+let selectedLeaderUserToggled = false;
+
+function getLocalPlayerPid() {
+  try {
+    if (typeof GameContext !== 'undefined') {
+      if (GameContext.localObserverID != null) return GameContext.localObserverID;
+      if (GameContext.localPlayerID != null) return GameContext.localPlayerID;
+    }
+  } catch (e) {}
+  return 0;
+}
+
+function isLeaderMetAtCurrentFrame(pid) {
+  if (pid == null) return false;
+  const met = fogMode ? metForPos() : null;
+  if (!met) return true;
+  return met.has(pid);
+}
+
 function buildRibbon() {
   const r = ensureRibbon(); ribbonHoverPid = null;
   const desired = ribbonMajors();
@@ -2202,7 +2222,17 @@ function buildRibbon() {
     const isNew = !row;
     if (isNew) {
       row = document.createElement('div'); row.__pid = pid;
-      row.style.cssText = `display:flex;align-items:center;margin:0 ${ps(3)}px ${ps(4)}px;border:${ps(1)}px solid #000;border-radius:${ps(16)}px;padding:${ps(2)}px ${ps(7)}px ${ps(2)}px ${ps(2)}px;pointer-events:auto;box-shadow:0 ${ps(1)}px ${ps(4)}px rgba(0,0,0,0.5);`;
+      row.style.cssText = `display:flex;align-items:center;margin:0 ${ps(3)}px ${ps(4)}px;border:${ps(1)}px solid #000;border-radius:${ps(16)}px;padding:${ps(2)}px ${ps(7)}px ${ps(2)}px ${ps(2)}px;pointer-events:auto;cursor:pointer;box-shadow:0 ${ps(1)}px ${ps(4)}px rgba(0,0,0,0.5);`;
+      row.addEventListener('click', (e) => {
+        e.stopPropagation();
+        selectedLeaderUserToggled = true;
+        if (selectedLeaderPid === pid) {
+          selectedLeaderPid = null;
+        } else {
+          selectedLeaderPid = pid;
+        }
+        updateRibbon();
+      });
       // pic is a circular-clip CONTAINER holding the leader's expression layers (neutral/happy/angry), each
       // bound once and toggled by display — so the hover reaction swap is a free show/hide, not a rebind. Each
       // layer carries its OWN border-radius:50% (the mechanism the original single-div portrait relied on to
@@ -2243,7 +2273,7 @@ function buildRibbon() {
     }
     if (civId !== row.__curCiv) showCivSym(row, civId);
     if (bgc !== row.__bgc) { row.style.backgroundColor = bgc; row.__bgc = bgc; }
-    if (border !== row.__border) { row.style.borderColor = border; pic.style.borderColor = border; row.__border = border; }
+    if (border !== row.__border) { row.__border = border; }
     if (row.style.display === 'none') { row.style.display = 'flex'; HB.ribs++; }   // HB counter: re-shows re-register the row
   }
   for (const [pid, row] of ribbonRows) { if (!shown.has(pid) && row.style.display !== 'none') row.style.display = 'none'; }   // hide (don't remove) leaders not met at this frame — rows stay in their inserted pid order
@@ -2318,7 +2348,8 @@ function ensureRelLayer(row, code) {
   }
   return layer;
 }
-function showRelSym(row, code) {   // met pair on hover → relationship icon; icon missing → keep the civ symbol
+function showRelSym(row, code) {   // active relationship code (1-4) → relationship icon; neutral/missing → civ icon
+  if (!code) { restoreCivSym(row); return; }
   const layer = ensureRelLayer(row, code);
   if (layer.__hasIcon) showSymLayer(row, layer); else restoreCivSym(row);
 }
@@ -2365,23 +2396,74 @@ function leaderPortraitCss(leaderType, code) {
   if (out) _portraitCache.set(key, out);   // cache successes only, so a not-yet-loaded portrait can retry
   return out;
 }
+
+function applyLeaderRowBorders(kids) {
+  const hoverActive = ribbonHoverPid != null && isLeaderMetAtCurrentFrame(ribbonHoverPid);
+  const selActive = selectedLeaderPid != null && isLeaderMetAtCurrentFrame(selectedLeaderPid);
+  const highlightPid = hoverActive ? ribbonHoverPid : (selActive ? selectedLeaderPid : null);
+
+  for (let k = 0; k < kids.length; k++) {
+    const row = kids[k], pid = row.__pid; if (pid == null) continue;
+    if (highlightPid != null && pid === highlightPid) {
+      row.style.boxShadow = `0 0 ${ps(8)}px rgba(235,190,80,0.8), 0 ${ps(1)}px ${ps(4)}px rgba(0,0,0,0.5)`;
+      row.style.borderColor = '#ebbe50';
+      if (row.__pic) row.__pic.style.borderColor = '#ebbe50';
+    } else {
+      row.style.boxShadow = `0 ${ps(1)}px ${ps(4)}px rgba(0,0,0,0.5)`;
+      if (row.__border != null) {
+        row.style.borderColor = row.__border;
+        if (row.__pic) row.__pic.style.borderColor = row.__border;
+      }
+    }
+  }
+}
+
 // While hovering leader `hoverPid`, every OTHER leader shows its reaction toward the hovered one — the
 // facial expression on its portrait (via the LEADER_HAPPY/LEADER_ANGRY icon context) AND its civ icon
 // swapped for the relationship icon. The hovered leader stays neutral. Pairs are symmetric (a<b key).
 // No hover → everyone neutral (clearRelationshipIcons).
 function applyRelationshipIcons(hoverPid) {
   const rel = relationshipForPos(), kids = els.ribbon ? els.ribbon.children : [];
+  applyLeaderRowBorders(kids);
   for (let k = 0; k < kids.length; k++) {
     const row = kids[k], pid = row.__pid; if (pid == null) continue;
     if (pid === hoverPid) { restoreCivSym(row); showPic(row, null); continue; }
     const code = rel.get(Math.min(hoverPid, pid) + ',' + Math.max(hoverPid, pid));
-    if (code != null) showRelSym(row, code); else restoreCivSym(row);   // met pair → relationship icon; unmet → keep civ icon
+    if (code) showRelSym(row, code); else restoreCivSym(row);   // active rel code (1-4) → rel icon; neutral or unmet → civ icon
     showPic(row, code != null ? code : 0);   // reaction expression layer (neutral if unmet)
   }
 }
 function clearRelationshipIcons() {
+  refreshRibbonDisplay();
+}
+function refreshRibbonDisplay() {
+  if (ribbonHoverPid != null) {
+    applyRelationshipIcons(ribbonHoverPid);
+    return;
+  }
   const kids = els.ribbon ? els.ribbon.children : [];
-  for (let k = 0; k < kids.length; k++) { restoreCivSym(kids[k]); showPic(kids[k], null); }
+  const rel = relationshipForPos();
+  const selActive = selectedLeaderPid != null && isLeaderMetAtCurrentFrame(selectedLeaderPid);
+
+  applyLeaderRowBorders(kids);
+
+  for (let k = 0; k < kids.length; k++) {
+    const row = kids[k], pid = row.__pid; if (pid == null) continue;
+
+    if (selActive) {
+      if (pid === selectedLeaderPid) {
+        restoreCivSym(row);
+        showPic(row, null);
+      } else {
+        const code = rel.get(Math.min(selectedLeaderPid, pid) + ',' + Math.max(selectedLeaderPid, pid));
+        if (code) showRelSym(row, code); else restoreCivSym(row);
+        showPic(row, code != null ? code : 0);
+      }
+    } else {
+      restoreCivSym(row);
+      showPic(row, null);
+    }
+  }
 }
 // Hit-test by COORDINATES (rect), not event.target — Gameface reports the map canvas as the mousemove
 // target even when the cursor is over UI overlapping it, so e.target can't tell us what's really hovered.
@@ -2416,6 +2498,12 @@ function updateRibbon() {
   if (sig !== ribbonSigLast) { buildRibbon(); ribbonSigLast = sig; }
   positionRibbon();
   r.style.display = 'flex';
+
+  if (!selectedLeaderUserToggled && selectedLeaderPid == null) {
+    selectedLeaderPid = getLocalPlayerPid();
+  }
+
+  refreshRibbonDisplay();
 }
 function buildPanel() {
   const p = document.createElement('div'); p.id = 'rewind-panel';
