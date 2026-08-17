@@ -1,24 +1,12 @@
-# REWIND: Replay Map History
+# REWIND: Civ 7 Replay Map History
 
-A **Sid Meier's Civilization VII** mod that records your game turn-by-turn and replays it
-as an animated hex-map timelapse — territory, borders, cities, units, wonders and resources
-across the whole game.
-
-Watch it in a new **Rewind** tab on the end-game Victories screen, or live in-game from a
-checkbox next to the minimap (with or without fog of war).
-
-## Features
-
-- **Turn-by-turn timelapse** of the whole map, reconstructed from a compact recording.
-- **Toggleable layers**: territory fills, borders, city/capital markers, units, wonders, resources.
-- **Fog of war** toggle — history-aware (leaders and tiles appear only once you'd met/seen them).
-- **Playback controls**: play/pause, step, 0.5×/1×/2×/4× speed, and a draggable scrubber with a
-  per-turn tooltip.
-- **Leader ribbon** showing the players present each turn, in their (age-correct) civ colors.
+REWIND is a Civilization VII replay mod that records your game turn-by-turn and lets you replay your map history as an animated timelapse. View the endgame map replay in a new Rewind tab on the Victories screen, or mid-game from a checkbox near the minimap. Territory, borders, cities, units, wonders, resources, and leader relationships are supported. Fog of war can be toggled, and is on by default to avoid spoiling the map. Enabling/disabling this mod does not impact your ability to load old saves.
 
 ## Install
 
-**Steam Workshop:** subscribe to the item at https://steamcommunity.com/sharedfiles/filedetails/?id=3759409080.
+**Steam Workshop:** subscribe at https://steamcommunity.com/sharedfiles/filedetails/?id=3759409080
+
+**CivMods:** download at https://civmods.com/install?modCfId=32874
 
 **Manual:** copy the `rewind/` folder into your Civilization VII `Mods` directory, e.g.
 
