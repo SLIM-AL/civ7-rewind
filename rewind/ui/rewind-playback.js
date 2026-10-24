@@ -132,9 +132,16 @@ function readUnitsTurn(t) {
   return arr;
 }
 // Per-age resource layer: OBJ_BASE key 'res_<ageId>' → Map(plotIndex -> classCode). Class colors match the
-// in-game resource-class icons (0 bonus green, 1 city blue, 2 empire amber, 3 treasure gold, 4 factory teal).
+// in-game resource-class icons (0 bonus green, 1 city blue, 2 empire amber, 3 treasure gold, 4 factory teal),
+// plus extra distinct fallback colors for dynamically-assigned codes (5+) from future ages or mods.
 const KEY_RES = 'res';
-const RESOURCE_COLOR = ['#5faa38', '#4a88cc', '#d7a03a', '#e6c144', '#43b598'];
+const RESOURCE_COLOR = ['#5faa38', '#4a88cc', '#d7a03a', '#e6c144', '#43b598', '#b86bd6', '#e06694', '#e07a47', '#dddddd'];
+function resourceColor(code) {
+  if (code == null || code < 0) return '#dddddd';
+  if (code < RESOURCE_COLOR.length) return RESOURCE_COLOR[code];
+  const extra = RESOURCE_COLOR.length - 5;
+  return RESOURCE_COLOR[5 + ((code - 5) % extra)];
+}
 const resCache = new Map();       // ageId -> Map(plotIndex -> classCode)     [dot color]
 const resTypeCache = new Map();   // ageId -> Map(plotIndex -> resourceType)  [tooltip name; empty for old recordings]
 function readResourcesForAge(ageId) {
@@ -1365,7 +1372,7 @@ function tryPartialState(frame, vis) {
   // when fog is on (fog off keeps them on their own canvases, untouched by these clears).
   if (showResources && vis && frames.length) {
     const res = resourcesForPos(), byColor = new Map();
-    for (const i of R) { if (vis[i] === 0) continue; const code = res.get(i); if (code != null) pushGroup(byColor, RESOURCE_COLOR[code] || '#dddddd', i); }
+    for (const i of R) { if (vis[i] === 0) continue; const code = res.get(i); if (code != null) pushGroup(byColor, resourceColor(code), i); }
     if (byColor.size) {
       mapCtx.lineJoin = 'round';
       const rw = Math.max(1, Math.round(hexW * 0.06));
@@ -1401,7 +1408,7 @@ function drawStateLayer(frame, vis) {
   // resource overlay under FOG only (vis-gated; fog off uses the per-age resource canvases instead)
   if (showResources && vis && frames.length) {
     const res = resourcesForPos(), byColor = new Map();
-    for (const [i, code] of res) { if (!basePos[i] || vis[i] === 0) continue; pushGroup(byColor, RESOURCE_COLOR[code] || '#dddddd', i); }
+    for (const [i, code] of res) { if (!basePos[i] || vis[i] === 0) continue; pushGroup(byColor, resourceColor(code), i); }
     if (byColor.size) {
       mapCtx.lineJoin = 'round';
       const rw = Math.max(1, Math.round(hexW * 0.06));
@@ -1416,7 +1423,7 @@ function drawStateLayer(frame, vis) {
 // Resource overlay: a thin hollow hex, inset, tinted by class. Constant within an age → one canvas per age.
 function paintResourcesForAge(ageId) {
   const res = readResourcesForAge(ageId), byColor = new Map();
-  for (const [i, code] of res) { if (!basePos[i]) continue; pushGroup(byColor, RESOURCE_COLOR[code] || '#dddddd', i); }
+  for (const [i, code] of res) { if (!basePos[i]) continue; pushGroup(byColor, resourceColor(code), i); }
   if (!byColor.size) return;
   mapCtx.lineJoin = 'round';
   const rw = Math.max(1, Math.round(hexW * 0.06));

@@ -74,8 +74,17 @@ const KEY_INDEX = 'index';
 const KEY_TERRAIN = 'terrain';
 const KEY_NATURAL = 'natural';
 const KEY_RES = 'res';   // per-age resource layer: OBJ_BASE key 'res_<ageId>' → [[plotIndex, classCode], …]
-// Resource class → compact code (matches playback's RESOURCE_COLOR).
+// Resource class → compact code (matches playback's RESOURCE_COLOR). The 5 known base classes use 0..4; any
+// new ResourceClassType (e.g. from a 4th age or other mods) is dynamically assigned the next integer code so
+// it is automatically recorded and given a distinct fallback outline color in playback.
 const RESOURCE_CLASS_CODE = { RESOURCECLASS_BONUS: 0, RESOURCECLASS_CITY: 1, RESOURCECLASS_EMPIRE: 2, RESOURCECLASS_TREASURE: 3, RESOURCECLASS_FACTORY: 4 };
+let nextResourceClassCode = 5;
+function resourceClassCode(cls) {
+  const key = cls || 'RESOURCECLASS_UNKNOWN';
+  let code = RESOURCE_CLASS_CODE[key];
+  if (code == null) { code = nextResourceClassCode++; RESOURCE_CLASS_CODE[key] = code; }
+  return code;
+}
 const MAX_PLAYER_ID = 63;   // sweep all slots so barbarians (alive=false, ~id 63) and independents are included
 
 // Civ 7 only writes console.warn/console.error to Logs/UI.log; console.log is dropped.
@@ -710,11 +719,11 @@ function captureResources() {
       let rt = null; try { rt = GameplayMap.getResourceType(loc.x, loc.y); } catch (e) {}
       if (rt == null || (typeof ResourceTypes !== 'undefined' && rt === ResourceTypes.NO_RESOURCE)) continue;
       let cls = null; try { const def = GameInfo.Resources.lookup(rt); cls = def && def.ResourceClassType; } catch (e) {}
-      const code = RESOURCE_CLASS_CODE[cls];
+      const code = resourceClassCode(cls);
       // Store the resource TYPE (rt) alongside the class code: the code drives the map dot's color, rt lets the
       // tooltip resolve the exact historical resource name from the same recorded snapshot as the dot (reading
       // the live map instead diverges — harvested/age-changed resources leave a dot with no name).
-      if (code != null) out.push([i, code, rt]);
+      out.push([i, code, rt]);
     }
     getCatalog().getObject(OBJ_BASE).write(KEY_RES + '_' + Game.age, JSON.stringify(out));
     log(`captured ${out.length} resources for age ${Game.age}`);
