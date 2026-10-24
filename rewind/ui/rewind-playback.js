@@ -2486,7 +2486,12 @@ function ribbonTipText(pid) {
   if (rec && Array.isArray(rec.vp) && labels.length) {
     const entry = rec.vp.find((v) => v[0] === pid);
     const scores = entry && Array.isArray(entry[1]) ? entry[1] : [];
-    for (let k = 0; k < labels.length; k++) lines.push(`${labels[k]}: ${scores[k] || 0}`);
+    for (let k = 0; k < labels.length; k++) {
+      // Score is always the last element of both labels and scores; if a later age discovered extra
+      // victory classes before Score, earlier frames' scores array is shorter (with Score still at its tail).
+      const sIdx = (k === labels.length - 1 && scores.length && scores.length < labels.length) ? scores.length - 1 : (k < scores.length - 1 || scores.length === labels.length ? k : -1);
+      lines.push(`${labels[k]}: ${(sIdx >= 0 && scores[sIdx]) || 0}`);
+    }
   }
   return lines.join('[N]');
 }

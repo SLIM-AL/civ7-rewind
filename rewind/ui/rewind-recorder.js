@@ -393,45 +393,78 @@ function settlementsDelta(snapshot) {
 // Score with 0 in the category columns.
 const VICTORY_CLASSES = ['VICTORY_CLASS_MILITARY', 'VICTORY_CLASS_ECONOMIC', 'VICTORY_CLASS_CULTURE', 'VICTORY_CLASS_SCIENCE'];
 const VICTORY_SCORE_CLASS = 'VICTORY_CLASS_SCORE';
-function ensureVictoryTypes() {
-  if (Array.isArray(manifest.victoryTypes) && manifest.victoryTypes.length) return;
+function getVictoryClasses() {
+  const classes = [...VICTORY_CLASSES];
+  const seen = new Set([...classes, VICTORY_SCORE_CLASS]);
+  try {
+    if (GameInfo.VictoryClasses) {
+      for (const vc of GameInfo.VictoryClasses) {
+        if (vc.VictoryClassType && !seen.has(vc.VictoryClassType)) { seen.add(vc.VictoryClassType); classes.push(vc.VictoryClassType); }
+      }
+    }
+    if (GameInfo.Victories) {
+      for (const v of GameInfo.Victories) {
+        if (v.VictoryClassType && !seen.has(v.VictoryClassType)) { seen.add(v.VictoryClassType); classes.push(v.VictoryClassType); }
+      }
+    }
+  } catch (e) {}
+  return classes;
+}
+function victoryClassLabel(cls) {
+  let name = cls.replace('VICTORY_CLASS_', ''); name = name.charAt(0) + name.slice(1).toLowerCase();   // "Military"
+  try { const d = GameInfo.VictoryClasses && GameInfo.VictoryClasses.lookup(cls); if (d && d.Name) { const n = Locale.compose(d.Name); if (n && !/^LOC_/.test(n)) name = n; } } catch (e) {}
+  return name;
+}
+function ensureVictoryTypes(force) {
+  if (!force && Array.isArray(manifest.victoryTypes) && manifest.victoryTypes.length) return;
+  const classes = getVictoryClasses();
   const out = [];
-  for (const cls of VICTORY_CLASSES) {
-    let name = cls.replace('VICTORY_CLASS_', ''); name = name.charAt(0) + name.slice(1).toLowerCase();   // "Military"
-    try { const d = GameInfo.VictoryClasses && GameInfo.VictoryClasses.lookup(cls); if (d && d.Name) { const n = Locale.compose(d.Name); if (n && !/^LOC_/.test(n)) name = n; } } catch (e) {}
-    out.push(name);
-  }
+  for (const cls of classes) out.push(victoryClassLabel(cls));
   out.push('Score');   // overall game score (VICTORY_SCORE) — its own metric, not the sum of the four
   manifest.victoryTypes = out;
 }
-// Map each VictoryClassType → its victory's $hash (the arg getPointsForVictoryType wants). One per class.
-function victoryHashByClass() {
+// Map each VictoryClassType → all of its victories' $hash values (the arg getPointsForVictoryType wants).
+// If an entry specifies an AgeType/Age matching the current Game.age, place its hash first so it is preferred,
+// while still collecting all hashes per class in case multiple ages' victories coexist in GameInfo.Victories.
+function victoryHashesByClass() {
   const m = {};
+  let curAgeType = null;
+  try { const ad = GameInfo.Ages && GameInfo.Ages.lookup(Game.age); if (ad && ad.AgeType) curAgeType = ad.AgeType; } catch (e) {}
   try {
     for (const v of GameInfo.Victories) {
-      if (v.VictoryClassType && m[v.VictoryClassType] == null) m[v.VictoryClassType] = v.$hash;
+      const cls = v.VictoryClassType;
+      if (!cls || v.$hash == null) continue;
+      if (!m[cls]) m[cls] = { active: [], all: [] };
+      m[cls].all.push(v.$hash);
+      const vAge = v.AgeType || v.Age;
+      if (vAge != null && (vAge === Game.age || (curAgeType && vAge === curAgeType))) m[cls].active.push(v.$hash);
     }
-  } catch (e) { err(`victoryHashByClass: ${e}`); }
+  } catch (e) { err(`victoryHashesByClass: ${e}`); }
   return m;
 }
-/** Per-major victory points this turn → [[playerId, [military, economic, cultural, scientific, score]], …]. */
+function pointsForVictoryClass(vic, entry) {
+  if (!entry || !vic || !vic.getPointsForVictoryType) return 0;
+  let best = 0;
+  if (entry.active.length) {
+    for (const h of entry.active) { try { const s = vic.getPointsForVictoryType(h) || 0; if (s > best) best = s; } catch (e) {} }
+    if (best > 0) return best | 0;
+  }
+  for (const h of entry.all) { try { const s = vic.getPointsForVictoryType(h) || 0; if (s > best) best = s; } catch (e) {} }
+  return best | 0;
+}
+/** Per-major victory points this turn → [[playerId, [military, economic, cultural, scientific, ..., score]], …]. */
 function readVictoryPoints() {
   const out = [];
   try {
-    const byClass = victoryHashByClass();
-    const scoreHash = byClass[VICTORY_SCORE_CLASS];
+    const classes = getVictoryClasses();
+    const byClass = victoryHashesByClass();
+    const scoreEntry = byClass[VICTORY_SCORE_CLASS];
     for (let pid = 0; pid <= MAX_PLAYER_ID; pid++) {
       const p = Players.get(pid);
       if (!p || !p.isMajor) continue;
       const vic = p.Victories, scores = [];
-      for (const cls of VICTORY_CLASSES) {
-        const h = byClass[cls]; let s = 0;
-        try { if (h != null && vic && vic.getPointsForVictoryType) s = vic.getPointsForVictoryType(h) || 0; } catch (e) {}
-        scores.push(s | 0);
-      }
-      let score = 0;
-      try { if (scoreHash != null && vic && vic.getPointsForVictoryType) score = vic.getPointsForVictoryType(scoreHash) || 0; } catch (e) {}
-      scores.push(score | 0);
+      for (const cls of classes) scores.push(pointsForVictoryClass(vic, byClass[cls]));
+      scores.push(pointsForVictoryClass(vic, scoreEntry));
       out.push([pid, scores]);
     }
   } catch (e) { err(`readVictoryPoints: ${e}`); }
@@ -808,7 +841,7 @@ function record(turn, forceSnap) {
   // churn the caches.
   if (snapshot || terr.length || vis.length || won.length || set.length || (bld && bld.length) || unitsJson !== lastUnitsJson || suzeJson !== lastSuzeJson) manifest.rev = (manifest.rev || 0) + 1;
   lastUnitsJson = unitsJson; lastSuzeJson = suzeJson;
-  ensureVictoryTypes();                    // record the victory-point column labels once
+  ensureVictoryTypes(snapshot);            // record/refresh the victory-point column labels on snapshots
   const vp = readVictoryPoints();          // per-major victory points by class + score (full each turn)
   const idd = identityDelta(snapshot);     // per-player identity, delta-coded
   const met = readMet();                   // majors the local observer has met (full each turn — small)
