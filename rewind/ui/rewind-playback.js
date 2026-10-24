@@ -357,7 +357,8 @@ function ownerColors(owner) {
   return out;
 }
 
-// per-owner classification — cached. kind:
+// per-owner classification — cached per (pos, owner) so independent-power slots recycled across ages
+// get their age-appropriate city-state type. kind:
 //   'major'     -> isMajor: real color, border, tint
 //   'citystate' -> independent power / city-state: white tint + type-color border & dot
 //   'village'   -> isBarbarian (camps): no border/fill
@@ -366,11 +367,18 @@ function ownerColors(owner) {
 // keying on only one mis-classified some city-states as majors (colored fill + dark secondary border).
 const ownerMetaCache = new Map();
 function csTypeLabel(def, code) {   // localized city-state type name ("Militaristic"), else title-cased code
-  try { if (def && def.Name) { const n = L(def.Name); if (n && !/^LOC_/.test(n)) return n; } } catch (e) {}
+  try {
+    if (!def && code && typeof GameInfo !== 'undefined' && GameInfo.CityStateTypes) {
+      def = GameInfo.CityStateTypes.lookup(code);
+      if (!def) for (const row of GameInfo.CityStateTypes) if (row && row.CityStateType === code) { def = row; break; }
+    }
+    if (def && def.Name) { const n = L(def.Name); if (n && !/^LOC_/.test(n)) return n; }
+  } catch (e) {}
   return code ? code.charAt(0) + code.slice(1).toLowerCase() : '';
 }
 function ownerMeta(owner) {
-  if (ownerMetaCache.has(owner)) return ownerMetaCache.get(owner);
+  const ck = pos + ':' + owner;
+  if (ownerMetaCache.has(ck)) return ownerMetaCache.get(ck);
   // Default to 'citystate' (neutral white + gray), NOT 'major'. 'major' is only assigned on a positive
   // isMajor. Otherwise a city-state whose Players.get is null (removed/absorbed independent) or that
   // momentarily reports both isMinor and isIndependent false would fall through and render with MAJOR
@@ -382,10 +390,13 @@ function ownerMeta(owner) {
     else if (pl && pl.isBarbarian) { kind = 'village'; resolved = true; }
     else {
       kind = 'citystate';   // any non-major, non-barbarian (incl. unclassifiable / null) → independent power
-      let def; try { if (pl && pl.getCityStateCityStateType) def = GameInfo.CityStateTypes.lookup(pl.getCityStateCityStateType()); } catch (e) {}
-      let code = def && def.CityStateType;
-      if (!code) {   // dispersed city-state: live lookup fails → recorded class (identity[6], absent pre-2026-07-09 recordings)
-        try { const id2 = identityForPos().get(owner); if (id2 && id2[6]) code = id2[6]; } catch (e) {}
+      // Prefer the recorded historical city-state class (identity[6]) for the viewed frame so independent
+      // slots reused across ages keep their historical type; fall back to the live engine lookup.
+      let code = null, def = null;
+      try { const id2 = identityForPos().get(owner); if (id2 && id2[6]) code = id2[6]; } catch (e) {}
+      if (!code) {
+        try { if (pl && pl.getCityStateCityStateType) def = GameInfo.CityStateTypes.lookup(pl.getCityStateCityStateType()); } catch (e) {}
+        code = def && def.CityStateType;
       }
       dotType = CITYSTATE_TYPE_COLOR[code] || '#dddddd';
       typeLabel = csTypeLabel(def, code);
@@ -395,7 +406,7 @@ function ownerMeta(owner) {
   const meta = { kind, dotType, typeLabel };
   // Don't cache an unresolved city-state (gray, unlabeled): the recorded class may become readable at a
   // different frame (identity is per-pos), and a later call should get to retry.
-  if (resolved) ownerMetaCache.set(owner, meta);
+  if (resolved) ownerMetaCache.set(ck, meta);
   return meta;
 }
 
@@ -1682,7 +1693,7 @@ function refresh() {
   const recordingChanged = fp !== lastRecordingFp;
   lastRecordingFp = fp;
   if (recordingChanged) {
-    turnCache.clear(); unitsCache.clear(); suzeCache.clear(); playersCache.clear(); ownerColorCache.clear(); resCache.clear(); resTypeCache.clear(); curBuildingsPos = -2; curSettlementsPos = -2; curVisPos = -2; curIdentityPos = -2; curRelPos = -2; curWondersPos = -2; ribbonSigLast = null;   // records re-read fresh (cheap; cleared for new-game safety)
+    turnCache.clear(); unitsCache.clear(); suzeCache.clear(); playersCache.clear(); ownerColorCache.clear(); ownerMetaCache.clear(); resCache.clear(); resTypeCache.clear(); curBuildingsPos = -2; curSettlementsPos = -2; curVisPos = -2; curIdentityPos = -2; curRelPos = -2; curWondersPos = -2; ribbonSigLast = null;   // records re-read fresh (cheap; cleared for new-game safety)
     recycleAllLayers(); lastStatePos = -2; lastStateSig = ''; lastSuzeSig = ''; lastStateFrame = null; conquestEpisodes = null;   // per-age canvases + state gate + conquest table hold frame-derived content → same new-game safety
   }
   frames = framesNow;   // already in chronological (gi) order
