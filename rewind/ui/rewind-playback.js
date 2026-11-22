@@ -22,6 +22,8 @@
 
 import ViewManager from '/core/ui/views/view-manager.js';
 import { Icon } from '/core/ui/utilities/utilities-image.js';
+import { InputEngineEventName } from '/core/ui/input/input-support.js';
+import { FocusManager } from '/core/ui-next/services/focus-manager.js';
 
 const TAG = '[REWIND]';
 const STORE_NS = 'CivRewind__';   // key prefix in the GAME config store (Configuration.getGame/editGame)
@@ -1777,9 +1779,9 @@ function onSeekEnd(e) { if (!seeking) return; seeking = false; seekTargetX = e.c
 // changes (not on every pixel of movement) so it isn't churning the DOM/retained resources while scrubbing;
 // it snaps to that frame's position on the track and sits just above it (the pill's transform centers+lifts).
 let lastHoverGi = -2;
-function onTrackHover(e) {
+function showTurnPillForGi(gi) {
   if (!els.label || !els.track || !frames.length) return;
-  const gi = Math.round(trackFrac(e.clientX) * (frames.length - 1));
+  gi = Math.max(0, Math.min(frames.length - 1, gi));
   if (gi === lastHoverGi && els.label.style.display === 'block') return;
   lastHoverGi = gi;
   const f = frames[gi];
@@ -1789,7 +1791,62 @@ function onTrackHover(e) {
   els.label.style.top = (r.top - ps(6)) + 'px';
   els.label.style.display = 'block';
 }
+function onTrackHover(e) {
+  if (!els.label || !els.track || !frames.length) return;
+  showTurnPillForGi(Math.round(trackFrac(e.clientX) * (frames.length - 1)));
+}
 function onTrackLeave() { lastHoverGi = -2; if (els.label) els.label.style.display = 'none'; }
+
+// --- controller / focus support ----------------------------------------------
+// Limited gamepad support: #rewind-panel's controlRow is a native <fxs-hslot>, so once FocusManager
+// moves focus onto a control inside it, D-pad/left-stick Left/Right cycles across all enabled layer
+// checkboxes and playback buttons (wrapping), A/Cross activates them, and Up/Down stay trapped in the
+// row. In endgameMode, LB/RB and LT/RT escape to VictoriesScreen (tab switch / One More Turn / Exit).
+// In-game, B/Circle (cancel) closes the overlay and restores focus to the minimap checkbox / prior focus.
+let prevFocusEl = null;
+function isControllerActive() {
+  try { return typeof Input !== 'undefined' && typeof InputDeviceType !== 'undefined' && Input.getActiveDeviceType() === InputDeviceType.Controller; }
+  catch (e) { return false; }
+}
+function focusReplayPanel() {
+  try {
+    if (!els.panel || !els.playBtn) return;
+    const fm = FocusManager.get();
+    if (!fm) return;
+    const cur = fm.currentFocus ? fm.currentFocus() : null;
+    if (cur && cur !== document.body && !els.panel.contains(cur)) prevFocusEl = cur;
+    fm.setFocus(els.playBtn);
+  } catch (e) { err(`focusReplayPanel: ${e}`); }
+}
+function restoreReplayFocus() {
+  try {
+    const fm = FocusManager.get();
+    const prior = prevFocusEl;
+    prevFocusEl = null;
+    if (!fm || !els.panel) return;
+    const cur = fm.currentFocus ? fm.currentFocus() : null;
+    if (!cur || !els.panel.contains(cur)) return;
+    const target = (!endgameMode && els.rewindCheckbox && els.rewindCheckbox.isConnected)
+      ? els.rewindCheckbox
+      : ((prior && prior.isConnected && !els.panel.contains(prior) && prior.hasAttribute && prior.hasAttribute('tabindex')) ? prior : null);
+    if (target) fm.setFocus(target);
+    else fm.clearFocus(els.panel);
+  } catch (e) { err(`restoreReplayFocus: ${e}`); }
+}
+function onInputSourceChanged() {
+  if (!mapVisible) return;
+  if (isControllerActive()) {
+    lastHoverGi = -2;
+    showTurnPillForGi(pos);
+    try {
+      const fm = FocusManager.get();
+      const cur = fm && fm.currentFocus ? fm.currentFocus() : null;
+      if (!cur || !els.panel || !els.panel.contains(cur)) focusReplayPanel();
+    } catch (e) {}
+  } else {
+    onTrackLeave();
+  }
+}
 
 // --- hover tooltips ----------------------------------------------------------
 // The unit-marker container (unitDom) is pointer-events:auto (so it's the cursor target over the map and
@@ -2130,6 +2187,7 @@ function mkToggle(labelText, initialOn, onChange) {
   const wrap = document.createElement('div'); wrap.className = 'flex flex-row items-center'; wrap.style.marginRight = ps(10) + 'px';
   if (UNIFY_PS_CHROME) wrap.style.flexShrink = '0';   // keep natural size so the group's overflow is measurable (fitControlRow scales the group to fit)
   const cb = document.createElement('fxs-checkbox'); cb.classList.add('mr-2'); cb.setAttribute('selected', initialOn ? 'true' : 'false');
+  cb.setAttribute('data-audio-focus-ref', 'data-audio-checkbox-focus');
   // fxs-checkbox sizes its host with the `size-8` class (→ 64px at high Interface Scale) and fills it with an
   // img-checkbox background. Pin a fixed ps() width/height (inline beats the class) so the box tracks
   // resolution like the slider/turn text and stays a consistent size on every screen.
@@ -2160,6 +2218,7 @@ function updateControls() {
   if (els.playBtn) { const cap = playing ? 'LOC_REWIND_PAUSE' : 'LOC_REWIND_PLAY'; if (cap !== els.playBtn.__cap) { els.playBtn.setAttribute('caption', cap); els.playBtn.__cap = cap; } }   // only on change
   const fill = ensureTrackFill();
   if (fill) fill.style.width = (frames.length > 1 ? (pos / (frames.length - 1)) * 100 : (frames.length ? 100 : 0)) + '%';
+  if (mapVisible && isControllerActive()) showTurnPillForGi(pos);
 }
 // --- leader ribbon (top-right, over the map) ---------------------------------
 // A compact stack of the major players present at the current frame: leader portrait + name + civ, in the
@@ -2534,8 +2593,24 @@ function buildPanel() {
   // Control row spans the panel: layer checkboxes flush-LEFT, playback buttons CENTERED (the equal flex:1
   // side groups grow to keep the center group on the map center), Fog + speed flush-RIGHT. If the content
   // can't fit the map width, fitControlRow() collapses it to a content-width cluster and scales it down.
-  const controlRow = document.createElement('div'); els.controlRow = controlRow;
+  // Built as an <fxs-hslot> so controller D-pad/left-stick Left/Right cycles focus across all enabled
+  // checkboxes and buttons (wrapping) while Up/Down stay trapped and LB/RB + LT/RT escape to VictoriesScreen.
+  const controlRow = document.createElement('fxs-hslot'); els.controlRow = controlRow;
+  controlRow.setAttribute('data-navrule-left', 'wrap');
+  controlRow.setAttribute('data-navrule-right', 'wrap');
+  controlRow.setAttribute('data-navrule-up', 'stop');
+  controlRow.setAttribute('data-navrule-down', 'stop');
   controlRow.style.cssText = 'display:flex;align-items:center;width:100%;flex-wrap:nowrap;';
+  // In-game overlay: pressing B/Circle (cancel) while focused in the panel closes the replay overlay
+  // without leaking to the HUD behind it. Endgame mode lets cancel bubble to ScreenFrame as usual.
+  p.addEventListener(InputEngineEventName, (e) => {
+    if (!mapVisible || endgameMode) return;
+    if (e.detail && e.detail.name === 'cancel' && typeof InputActionStatuses !== 'undefined' && e.detail.status === InputActionStatuses.FINISH) {
+      closePanel();
+      e.preventDefault();
+      e.stopPropagation();
+    }
+  });
   const terr = mkToggle('Territory', showTerritory, (on) => { showTerritory = on; redraw(); });
   const bord = mkToggle('Borders', showBorders, (on) => { showBorders = on; redraw(); });
   const unit = mkToggle('Units', showUnits, (on) => { showUnits = on; redraw(); });
@@ -2661,13 +2736,15 @@ function reveal() {
   els.panel.style.visibility = '';   // reveal the scrub panel
   try { requestAnimationFrame(() => { fit(); requestAnimationFrame(fit); }); } catch (e) {}
   try { setTimeout(fit, 130); } catch (e) {}
-  if (els.label) els.label.style.display = 'none';   // turn pill shows only on scrubber hover
+  if (els.label) els.label.style.display = 'none';   // turn pill shows on scrubber hover (or continuously in controller mode)
+  lastHoverGi = -2;
   setMapVisible(true);
   applyOpenPosition();
   drawMap(frameFor(pos));   // draw the chosen frame (also applies current fog / corrects a prebuilt map opened at a new position)
   pause();
   updateControls();
   updateRibbon();
+  focusReplayPanel();
 }
 // "Loading map…" placard for the in-game launcher (the endgame tab shows its own native loading text).
 function showLoading() {
@@ -2708,9 +2785,10 @@ function requestShow(usePlacard) {
 function closePanel() {
   revealWhenBuilt = false;
   pause();
+  restoreReplayFocus();
   if (els.panel) els.panel.style.display = 'none';
   if (els.ribbon) els.ribbon.style.display = 'none';
-  if (els.label) els.label.style.display = 'none';
+  onTrackLeave();
   hideIcelandBg();
   setMapVisible(false);
   hideLoading();
@@ -2755,6 +2833,7 @@ function ensureRewindCheckbox() {
     cb.classList.add('mr-2', 'ml-6');                                      // ml-6 separates it from the Show Minimap label
     cb.setAttribute('selected', mapVisible ? 'true' : 'false');
     cb.setAttribute('data-audio-group-ref', 'audio-panel-mini-map');
+    cb.setAttribute('data-audio-focus-ref', 'data-audio-checkbox-focus');
     cb.addEventListener('component-value-changed', (e) => {
       if (suppressCheckbox) return;                                        // ignore our own programmatic sync
       const on = !!(e.detail && e.detail.value);
@@ -2811,5 +2890,6 @@ function onEnterGame(evt) {
 log('playback UI module loaded — binding lifecycle events');
 engine.on('GameStarted', () => onEnterGame('GameStarted'));
 engine.on('LoadComplete', () => onEnterGame('LoadComplete'));
+try { engine.on('input-source-changed', onInputSourceChanged); } catch (e) { }
 try { window.addEventListener('view-changed', onViewChanged); } catch (e) { }
 try { if (typeof UI !== 'undefined' && UI.isInGame && UI.isInGame()) onEnterGame('module-load'); } catch (e) { }
