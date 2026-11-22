@@ -61,6 +61,16 @@ copy_mod() {
 
 copy_mod "$REPO_DIR/rewind" "rewind_map_history"
 
+# Tag the deployed copy's <Name> and <Description> with LOCAL (no brackets — Civ 7 treats [...] as
+# markup) so it's easy to distinguish from the Steam Workshop subscription in Add-Ons without modifying
+# the repo's rewind/rewind.modinfo.
+DEPLOYED_MODINFO="$MODS_DIR/rewind_map_history/rewind.modinfo"
+if [[ -f "$DEPLOYED_MODINFO" ]]; then
+  sed -i 's|<Name>\(.*\)</Name>|<Name>\1 LOCAL</Name>|' "$DEPLOYED_MODINFO"
+  sed -i 's|<Description>\(.*\)</Description>|<Description>LOCAL \1</Description>|' "$DEPLOYED_MODINFO"
+  echo "Tagged deployed modinfo title and description with LOCAL"
+fi
+
 # The mod's id/folder was renamed (civ7-rewind -> rewind_map_history); remove the old deployment so the
 # game doesn't load two copies. (Old test saves referenced the old id and won't load — they were throwaway.)
 if [[ -e "$MODS_DIR/civ7-rewind" ]]; then
